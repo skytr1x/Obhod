@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "updated": "split-sni-mobile",
+  "socks_port": 10800,
+  "default_ttl": 64,
+  "direct_ru": true,
+  "include": [
+    "youtube.com", "googlevideo.com", "ytimg.com", "youtubei.googleapis.com",
+    "discord.com", "discord.gg", "discord.media", "discordapp.com", "discordapp.net", "discordcdn.com",
+    "twitch.tv", "ttvnw.net", "jtvnw.net",
+    "instagram.com", "facebook.com", "fbcdn.net", "messenger.com",
+    "twitter.com", "x.com", "t.co", "twimg.com"
+  ],
+  "defaults": {
+    "tcp": ["split-sni", "split-1", "direct"],
+    "udp": ["quic-fake", "direct"]
+  },
+  "strategies": [
+    { "id": "split-sni", "cost": 1, "tcp": { "actions": [ { "type": "split", "pos": "sni" } ] } },
+    { "id": "split-1", "cost": 2, "tcp": { "actions": [ { "type": "split", "pos": "1" } ] } },
+    { "id": "quic-fake", "cost": 1, "udp": { "fake": { "count": 6, "ttl": 8, "payload": "quic_google" } } },
+    { "id": "direct", "cost": 99, "action": "direct" }
+  ]
+}

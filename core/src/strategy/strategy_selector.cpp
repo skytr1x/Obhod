@@ -1,6 +1,7 @@
 #include "strategy_selector.h"
 
 #include <algorithm>
+#include <arpa/inet.h>
 #include <cctype>
 #include <cstdio>
 #include <ctime>
@@ -28,6 +29,13 @@ bool isTunnelId(const std::string& id) {
 
 bool isDirectStrategy(const StrategyDef* strategy) {
     return strategy && (strategy->direct || isDirectId(strategy->id));
+}
+
+bool isIpLiteral(const std::string& host) {
+    in_addr ipv4{};
+    in6_addr ipv6{};
+    return inet_pton(AF_INET, host.c_str(), &ipv4) == 1 ||
+           inet_pton(AF_INET6, host.c_str(), &ipv6) == 1;
 }
 
 std::string sanitizeCacheName(const std::string& key) {
@@ -246,7 +254,9 @@ StrategyChoice StrategySelector::routeLocked(const std::string& rawHost, bool ud
             choice.direct = true;
             return choice;
         }
-        if (!m_profile->include.empty() && !m_profile->include.matches(host)) {
+        const bool udpIpHasNoDomain = udp && isIpLiteral(host);
+        if (!m_profile->include.empty() && !m_profile->include.matches(host) &&
+            !udpIpHasNoDomain) {
             choice.direct = true;
             return choice;
         }
@@ -287,7 +297,8 @@ std::vector<StrategyChoice> StrategySelector::candidatesLocked(const std::string
         }
         if (m_profile->exclude.matches(host) ||
             (m_profile->directRu && isRussianDomain(host)) ||
-            (!m_profile->include.empty() && !m_profile->include.matches(host))) {
+            (!m_profile->include.empty() && !m_profile->include.matches(host) &&
+             !(udp && isIpLiteral(host)))) {
             StrategyChoice choice;
             choice.owner = m_profile;
             choice.direct = true;

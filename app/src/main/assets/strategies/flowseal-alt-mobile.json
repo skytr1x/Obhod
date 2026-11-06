@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "updated": "flowseal-alt-mobile",
+  "socks_port": 10800,
+  "default_ttl": 64,
+  "direct_ru": true,
+  "include": [
+    "youtube.com", "googlevideo.com", "ytimg.com", "youtubei.googleapis.com",
+    "discord.com", "discord.gg", "discord.media", "discordapp.com", "discordapp.net", "discordcdn.com",
+    "twitch.tv", "ttvnw.net", "jtvnw.net",
+    "instagram.com", "facebook.com", "fbcdn.net", "messenger.com",
+    "twitter.com", "x.com", "t.co", "twimg.com"
+  ],
+  "defaults": {
+    "tcp": ["fake-tls", "disorder-1", "multisplit-mobile", "split-sni", "split-1", "tlsrec-sni", "direct"],
+    "udp": ["quic-fake", "direct"]
+  },
+  "strategies": [
+    { "id": "fake-tls", "cost": 1, "tcp": { "actions": [ { "type": "fake", "pos": "sni_end", "ttl_range": [2, 6], "payload": "tls_google" } ] } },
+    { "id": "fake-tls-4pda", "cost": 2, "tcp": { "actions": [ { "type": "fake", "pos": "sni_end", "ttl_range": [2, 6], "payload": "tls_4pda" } ] } },
+    { "id": "disorder-1", "cost": 3, "tcp": { "actions": [ { "type": "disorder", "pos": "1" } ] } },
+    { "id": "multisplit-mobile", "cost": 4, "tcp": { "actions": [ { "type": "split", "pos": "1" }, { "type": "split", "pos": "midsld" } ] } },
+    { "id": "split-sni", "cost": 5, "tcp": { "actions": [ { "type": "split", "pos": "sni" } ] } },
+    { "id": "split-1", "cost": 6, "tcp": { "actions": [ { "type": "split", "pos": "1" } ] } },
+    { "id": "tlsrec-sni", "cost": 7, "tcp": { "actions": [ { "type": "tlsrec", "pos": "sni" } ] } },
+    { "id": "quic-fake", "cost": 1, "udp": { "fake": { "count": 6, "ttl": 8, "payload": "quic_google" } } },
+    { "id": "direct", "cost": 99, "action": "direct" }
+  ]
+}

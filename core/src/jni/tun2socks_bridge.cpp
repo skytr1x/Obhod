@@ -2,6 +2,7 @@
 #include <android/log.h>
 #include <thread>
 #include <atomic>
+#include <mutex>
 #include <string>
 #include <unistd.h>
 
@@ -17,11 +18,13 @@ extern "C" {
 
 static std::atomic<bool> g_tunnelRunning{false};
 static std::thread g_tunnelThread;
+static std::mutex g_tunnelMutex;
 
 extern "C" {
 
 JNIEXPORT jboolean JNICALL
-Java_com_skyunblock_NativeBridge_startTunnel(JNIEnv* env, jclass clazz, jint tunFd, jstring configPath) {
+Java_com_skytr1x_obhod_NativeBridge_startTunnel(JNIEnv* env, jclass clazz, jint tunFd, jstring configPath) {
+    std::lock_guard<std::mutex> lock(g_tunnelMutex);
     if (g_tunnelRunning.load()) {
         LOGD("startTunnel: already running");
         return JNI_FALSE;
@@ -39,6 +42,7 @@ Java_com_skyunblock_NativeBridge_startTunnel(JNIEnv* env, jclass clazz, jint tun
     LOGD("startTunnel: tunFd=%d, config=%s", fd, cfgPath.c_str());
 
 #ifdef HEV_SOCKS5_TUNNEL_AVAILABLE
+    if (g_tunnelThread.joinable()) g_tunnelThread.join();
     LOGD("Preparing to start hev_socks5_tunnel_main_from_file...");
     g_tunnelRunning.store(true);
     g_tunnelThread = std::thread([fd, cfgPath]() {
@@ -51,7 +55,6 @@ Java_com_skyunblock_NativeBridge_startTunnel(JNIEnv* env, jclass clazz, jint tun
         g_tunnelRunning.store(false);
         LOGD("Tunnel thread exited");
     });
-    g_tunnelThread.detach();
     LOGD("startTunnel: thread dispatched successfully");
     return JNI_TRUE;
 #else
@@ -65,20 +68,22 @@ Java_com_skyunblock_NativeBridge_startTunnel(JNIEnv* env, jclass clazz, jint tun
 }
 
 JNIEXPORT void JNICALL
-Java_com_skyunblock_NativeBridge_stopTunnel(JNIEnv* env, jclass clazz) {
+Java_com_skytr1x_obhod_NativeBridge_stopTunnel(JNIEnv* env, jclass clazz) {
+    std::lock_guard<std::mutex> lock(g_tunnelMutex);
     LOGD("stopTunnel called");
-    if (!g_tunnelRunning.load()) {
+    if (!g_tunnelRunning.load() && !g_tunnelThread.joinable()) {
         LOGD("stopTunnel: not running");
         return;
     }
 #ifdef HEV_SOCKS5_TUNNEL_AVAILABLE
-    hev_socks5_tunnel_quit();
+    if (g_tunnelRunning.load()) hev_socks5_tunnel_quit();
+    if (g_tunnelThread.joinable()) g_tunnelThread.join();
 #endif
     g_tunnelRunning.store(false);
 }
 
 JNIEXPORT jboolean JNICALL
-Java_com_skyunblock_NativeBridge_isTunnelRunning(JNIEnv* env, jclass clazz) {
+Java_com_skytr1x_obhod_NativeBridge_isTunnelRunning(JNIEnv* env, jclass clazz) {
     return g_tunnelRunning.load() ? JNI_TRUE : JNI_FALSE;
 }
 

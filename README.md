@@ -1,20 +1,10 @@
-# Telegram Proxy для Android
+# Obhod - обход блокировок с телефона
 
-Приложение запускает локальный MTProto-прокси на `127.0.0.1:1443`. Rust-библиотека
-передаёт Telegram MTProto-трафик через WebSocket и резервные маршруты. VPN,
-общесистемная фильтрация и Python runtime не используются.
+Obhod - гибрид [tg-ws-proxy-android](https://github.com/amurcanov/tg-ws-proxy-android) и [zapret](https://github.com/flowseal/zapret-discord-youtube) для телефона.
 
-В интерфейсе можно запустить или остановить прокси, скопировать его данные либо
-открыть ссылку настройки Telegram. Секрет генерируется и хранится локально.
-Прокси доступен Telegram на этом устройстве только пока работает фоновая служба.
+Для обхода блокировки телеграм через MTProxy используеться Rust подход из андроид версии tg-ws-proxy указаной выше. Когда как для обход других блокировок проходит через систему fake TLS от Zapret.
 
-Android-приложение включает Rust-библиотеку для `arm64-v8a` и `armeabi-v7a`.
-Исходный Rust crate находится в `native/tgwsproxy`; сведения о лицензии — в
-`third_party/tg-ws-proxy/LICENSE`.
-
-Для сборки установите Rust targets командой
-`rustup target add aarch64-linux-android armv7-linux-androideabi`, а также
-Android NDK версии из `app/build.gradle.kts`. Затем запустите
-`./gradlew :app:assembleDebug`. Задачи `buildTelegramRustArm64` и
-`buildTelegramRustArm32` собирают библиотеку через Cargo; `preBuild` запускает
-обе автоматически и передаёт результаты в Android packaging.
+В приложении можно выбрать Android-вариант профиля `General`, `ALT`, `Simple Fake`
+или `Split SNI`. Профиль применяется к выбранным доменам через Android VPN;
+список тактик и ограничения переноса с Windows описаны в
+[`docs/zapret-android-mapping.md`](docs/zapret-android-mapping.md).

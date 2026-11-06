@@ -60,7 +60,7 @@ class TelegramProxyService : Service() {
                 starting = false
                 publishState(true)
                 Log.i(TAG, "Telegram MTProto proxy listening on ${TelegramProxyConfig.HOST}:${TelegramProxyConfig.PORT}")
-                updateNotification("Обход Telegram включён")
+                updateNotification("Обход Телеграм включён")
             } catch (error: Throwable) {
                 Log.e(TAG, "Telegram proxy startup failed", error)
                 starting = false
