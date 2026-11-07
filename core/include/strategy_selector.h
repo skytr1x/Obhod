@@ -43,7 +43,8 @@ public:
     StrategyChoice select(const std::string& host, bool udp = false) const;
     std::vector<StrategyChoice> candidates(const std::string& host, bool udp = false) const;
 
-    void markSuccess(const std::string& host, const std::string& strategyId);
+    void markSuccess(const std::string& host, const std::string& strategyId,
+                     long latencyMs = -1);
     void markFailure(const std::string& host, const std::string& strategyId);
     void clearCache();
 
@@ -58,8 +59,16 @@ public:
 
 private:
     struct HostState {
+        struct Metric {
+            double failures = 0.0;
+            std::chrono::steady_clock::time_point failedAt{};
+            int attempts = 0;
+            int successes = 0;
+            long latencyMs = -1;
+        };
+
         std::string preferred;
-        std::unordered_map<std::string, int> failures;
+        std::unordered_map<std::string, Metric> metrics;
         std::chrono::steady_clock::time_point updated;
     };
 
@@ -77,6 +86,10 @@ private:
     void loadCacheLocked();
     void saveCacheLocked();
     void clearCacheLocked(bool removeFile);
+    void remapCacheLocked();
+    bool strategyKnownLocked(const std::string& key) const;
+    static double decayedFailures(const HostState::Metric& metric,
+                                  std::chrono::steady_clock::time_point now);
 };
 
 const char* actionTypeName(ActionType type);

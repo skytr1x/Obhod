@@ -67,6 +67,7 @@ struct Profile {
     bool tcpNodelay = true;
     bool directRu = true;
     int delayMs = 0;
+    bool quicFallback = true;
 
     std::vector<StrategyDef> strategies;
     std::vector<HostRule> rules;

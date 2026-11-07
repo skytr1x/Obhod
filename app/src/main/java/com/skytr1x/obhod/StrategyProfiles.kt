@@ -13,12 +13,12 @@ object StrategyProfiles {
         StrategyProfileOption(
             "flowseal-general-mobile",
             "General",
-            "Несколько разрезов TCP-запроса и запасные split/fake/disorder приёмы. UDP 443: QUIC fake ×6."
+            "Несколько разрезов TCP-запроса и запасные split/fake/disorder приёмы. QUIC на 443 уводится в TCP, UDP-фейки - для остальных портов."
         ),
         StrategyProfileOption(
             "flowseal-alt-mobile",
             "ALT",
-            "fake ClientHello с перебором TTL, затем split/disorder. UDP 443: QUIC fake ×6."
+            "fake ClientHello с перебором TTL, затем split/disorder. QUIC на 443 уводится в TCP, UDP-фейки - для остальных портов."
         ),
         StrategyProfileOption(
             "simple-fake-mobile",

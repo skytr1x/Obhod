@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <ctime>
 #include <fstream>
@@ -18,6 +19,7 @@ namespace skyunblock {
 namespace {
 constexpr auto kCacheTtl = std::chrono::hours(6);
 constexpr std::size_t kMaxCacheEntries = 4096;
+constexpr double kFailureHalfLifeHours = 2.0;
 
 bool isDirectId(const std::string& id) {
     return id == "direct" || id == "bypass" || id == "none";
@@ -90,15 +92,17 @@ StrategySelector::StrategySelector(std::shared_ptr<Profile> profile)
 void StrategySelector::setProfile(std::shared_ptr<Profile> profile) {
     if (!profile) return;
     std::shared_ptr<Profile> applied;
+    std::size_t cached = 0;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_profile = std::move(profile);
         applied = m_profile;
-        clearCacheLocked(true);
+        remapCacheLocked();
+        cached = m_cache.size();
     }
-    SKY_LOGI("StrategySelector: profile '%s' applied (%zu strategies, %zu rules)",
+    SKY_LOGI("StrategySelector: profile '%s' applied (%zu strategies, %zu rules, %zu cached hosts)",
              applied->updated.c_str(), applied->strategies.size(),
-             applied->rules.size());
+             applied->rules.size(), cached);
 }
 
 std::shared_ptr<const Profile> StrategySelector::profile() const {
@@ -205,6 +209,51 @@ void StrategySelector::clearCacheLocked(bool removeFile) {
     if (removeFile && !m_cacheBasePath.empty()) {
         const std::string path = cacheFileLocked();
         if (!path.empty()) ::unlink(path.c_str());
+    }
+}
+
+double StrategySelector::decayedFailures(const HostState::Metric& metric,
+                                         std::chrono::steady_clock::time_point now) {
+    if (metric.failures <= 0.0) return 0.0;
+    const double ageHours =
+        std::chrono::duration<double, std::ratio<3600>>(now - metric.failedAt).count();
+    return metric.failures * std::exp2(-ageHours / kFailureHalfLifeHours);
+}
+
+bool StrategySelector::strategyKnownLocked(const std::string& key) const {
+    if (key == "direct" || key == "tunnel" || key == "none") return true;
+    if (!m_profile) return false;
+    const std::string id = key.substr(0, key.find('@'));
+    return m_profile->findStrategy(id) != nullptr;
+}
+
+void StrategySelector::remapCacheLocked() {
+    std::size_t droppedPreferred = 0;
+    std::size_t droppedMetrics = 0;
+    for (auto stateIt = m_cache.begin(); stateIt != m_cache.end();) {
+        HostState& state = stateIt->second;
+        if (!state.preferred.empty() && !strategyKnownLocked(state.preferred)) {
+            state.preferred.clear();
+            ++droppedPreferred;
+        }
+        for (auto metricIt = state.metrics.begin(); metricIt != state.metrics.end();) {
+            if (!strategyKnownLocked(metricIt->first)) {
+                metricIt = state.metrics.erase(metricIt);
+                ++droppedMetrics;
+            } else {
+                ++metricIt;
+            }
+        }
+        if (state.preferred.empty() && state.metrics.empty()) {
+            stateIt = m_cache.erase(stateIt);
+        } else {
+            ++stateIt;
+        }
+    }
+    saveCacheLocked();
+    if (droppedPreferred > 0 || droppedMetrics > 0) {
+        SKY_LOGI("StrategySelector: profile remap dropped %zu cached strategies, %zu metrics",
+                 droppedPreferred, droppedMetrics);
     }
 }
 
@@ -394,18 +443,36 @@ std::vector<StrategyChoice> StrategySelector::candidatesLocked(const std::string
         }
     }
 
-    if (state && !state->failures.empty()) {
+    if (state && !state->metrics.empty()) {
+        const auto now = std::chrono::steady_clock::now();
+        auto metricFor = [&](const StrategyChoice& choice) {
+            auto it = state->metrics.find(choice.key());
+            return it == state->metrics.end() ? nullptr : &it->second;
+        };
         std::stable_sort(expanded.begin(), expanded.end(),
                          [&](const StrategyChoice& a, const StrategyChoice& b) {
-                             const int af = [&] {
-                                 auto f = state->failures.find(a.key());
-                                 return f == state->failures.end() ? 0 : f->second;
-                             }();
-                             const int bf = [&] {
-                                 auto f = state->failures.find(b.key());
-                                 return f == state->failures.end() ? 0 : f->second;
-                             }();
-                             return af < bf;
+                             const bool ap = a.key() == state->preferred;
+                             const bool bp = b.key() == state->preferred;
+                             if (ap != bp) return ap;
+
+                             const HostState::Metric* am = metricFor(a);
+                             const HostState::Metric* bm = metricFor(b);
+                             const double af = am ? decayedFailures(*am, now) : 0.0;
+                             const double bf = bm ? decayedFailures(*bm, now) : 0.0;
+                             if (af != bf) return af < bf;
+
+                             const bool aTested = am && am->attempts > 0;
+                             const bool bTested = bm && bm->attempts > 0;
+                             if (aTested != bTested) return aTested;
+                             const double ar = aTested
+                                 ? static_cast<double>(am->successes) / am->attempts : 0.0;
+                             const double br = bTested
+                                 ? static_cast<double>(bm->successes) / bm->attempts : 0.0;
+                             if (ar != br) return ar > br;
+
+                             const long al = am && am->latencyMs > 0 ? am->latencyMs : 1L << 30;
+                             const long bl = bm && bm->latencyMs > 0 ? bm->latencyMs : 1L << 30;
+                             return al < bl;
                          });
     }
 
@@ -436,14 +503,29 @@ std::vector<StrategyChoice> StrategySelector::candidates(const std::string& host
     return candidatesLocked(host, udp);
 }
 
-void StrategySelector::markSuccess(const std::string& rawHost, const std::string& strategyId) {
+void StrategySelector::markSuccess(const std::string& rawHost, const std::string& strategyId,
+                                   long latencyMs) {
     if (strategyId.empty()) return;
     const std::string host = normalizeHost(rawHost);
     std::lock_guard<std::mutex> lock(m_mutex);
+    const auto now = std::chrono::steady_clock::now();
     HostState& state = m_cache[host];
     state.preferred = strategyId;
-    state.failures.erase(strategyId);
-    state.updated = std::chrono::steady_clock::now();
+    for (auto& entry : state.metrics) {
+        HostState::Metric& metric = entry.second;
+        metric.failures = decayedFailures(metric, now) * 0.5;
+        if (metric.failures < 0.01) metric.failures = 0.0;
+        metric.failedAt = now;
+    }
+    HostState::Metric& metric = state.metrics[strategyId];
+    ++metric.attempts;
+    ++metric.successes;
+    if (latencyMs > 0) {
+        metric.latencyMs = metric.latencyMs <= 0
+            ? latencyMs
+            : (metric.latencyMs * 3 + latencyMs) / 4;
+    }
+    state.updated = now;
     saveCacheLocked();
     SKY_LOGI("StrategySelector: '%s' works for '%s'", strategyId.c_str(), host.c_str());
 }
@@ -452,15 +534,19 @@ void StrategySelector::markFailure(const std::string& rawHost, const std::string
     if (strategyId.empty()) return;
     const std::string host = normalizeHost(rawHost);
     std::lock_guard<std::mutex> lock(m_mutex);
+    const auto now = std::chrono::steady_clock::now();
     HostState& state = m_cache[host];
-    ++state.failures[strategyId];
+    HostState::Metric& metric = state.metrics[strategyId];
+    metric.failures = decayedFailures(metric, now) + 1.0;
+    metric.failedAt = now;
+    ++metric.attempts;
     if (state.preferred == strategyId) {
         state.preferred.clear();
         saveCacheLocked();
     }
-    state.updated = std::chrono::steady_clock::now();
-    SKY_LOGD("StrategySelector: '%s' failed for '%s' (%d times)",
-             strategyId.c_str(), host.c_str(), state.failures[strategyId]);
+    state.updated = now;
+    SKY_LOGD("StrategySelector: '%s' failed for '%s' (weight %.1f)",
+             strategyId.c_str(), host.c_str(), metric.failures);
 }
 
 void StrategySelector::clearCache() {

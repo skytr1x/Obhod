@@ -393,10 +393,12 @@ std::shared_ptr<Profile> parseProfile(const std::string& text, std::string& erro
     profile->tcpNodelay = getBool(&root, "tcp_nodelay", true);
     profile->directRu = getBool(&root, "direct_ru", true);
     profile->delayMs = getInt(&root, "delay_ms", 0);
+    profile->quicFallback = getBool(&root, "quic_fallback", true);
 
     const JsonValue* routing = root.find("routing");
     if (routing) {
         profile->directRu = getBool(routing, "direct_ru", profile->directRu);
+        profile->quicFallback = getBool(routing, "quic_fallback", profile->quicFallback);
         addRules(profile->rules, routing->find("tunnel_domains"), "tunnel");
         addRules(profile->rules, routing->find("direct_domains"), "direct");
     }

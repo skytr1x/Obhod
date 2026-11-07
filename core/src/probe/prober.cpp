@@ -334,7 +334,8 @@ ProbeResult Prober::probe(const std::string& host, int port) {
             result.strategy = attempt.strategy;
             result.latencyMs = attempt.connectMs + attempt.responseMs;
             if (m_selector && choice.strategy) {
-                m_selector->markSuccess(host, choice.key());
+                m_selector->markSuccess(host, choice.key(),
+                                        attempt.connectMs + attempt.responseMs);
             }
         } else if (!ok && m_selector && choice.strategy) {
             m_selector->markFailure(host, choice.key());

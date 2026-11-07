@@ -55,7 +55,11 @@ private:
         uint16_t port = 0;
         struct sockaddr_storage addr {};
         socklen_t addrLen = 0;
-        bool fakesSent = false;
+        std::string strategyKey;
+        bool udpVerified = false;
+        std::chrono::steady_clock::time_point lastFakeAt{};
+        uint64_t rxAtLastFake = 0;
+        uint64_t txAtLastFake = 0;
         uint64_t sentPackets = 0;
         uint64_t receivedPackets = 0;
         uint64_t sentBytes = 0;
@@ -88,7 +92,7 @@ private:
                           SendOutcome& outcome);
     bool waitForResponse(int fd, int timeoutMs, bool& readable, std::string& error);
     void relay(int clientFd, int remoteFd, const std::string& host = {},
-               uint16_t port = 0, bool reportStream = false);
+               uint16_t port = 0, bool reportStream = false, int idleTimeoutMs = 0);
 
     bool createRemoteUdp(const std::string& host, uint16_t port, UdpPeer& peer,
                          std::string& error);

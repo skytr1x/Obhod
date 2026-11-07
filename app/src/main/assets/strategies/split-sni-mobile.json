@@ -4,6 +4,7 @@
   "socks_port": 10800,
   "default_ttl": 64,
   "direct_ru": true,
+  "quic_fallback": true,
   "include": [
     "youtube.com", "googlevideo.com", "ytimg.com", "youtubei.googleapis.com",
     "discord.com", "discord.gg", "discord.media", "discordapp.com", "discordapp.net", "discordcdn.com",

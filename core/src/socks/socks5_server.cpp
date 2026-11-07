@@ -46,6 +46,7 @@ constexpr int kResponseTimeoutMs = 3000;
 constexpr int kMaxStrategyAttempts = 16;
 constexpr int kStrategyBudgetMs = 18000;
 constexpr int kRelayIdleTimeoutMs = 120000;
+constexpr int kRelayTunnelIdleTimeoutMs = 300000;
 constexpr std::size_t kMaxFirstPayload = 32768;
 constexpr std::size_t kMaxUdpPeers = 64;
 
@@ -325,6 +326,24 @@ bool isLoopback(const sockaddr* addr) {
 
 std::string udpKey(const std::string& host, uint16_t port) {
     return host + ':' + std::to_string(port);
+}
+
+bool isQuicInitial(const uint8_t* data, std::size_t len) {
+    if (len < 5 || (data[0] & 0xc0) != 0xc0) return false;
+    const uint32_t version = (static_cast<uint32_t>(data[1]) << 24) |
+                             (static_cast<uint32_t>(data[2]) << 16) |
+                             (static_cast<uint32_t>(data[3]) << 8) |
+                             static_cast<uint32_t>(data[4]);
+    switch (version) {
+        case 0x00000001:  // QUIC v1
+        case 0x6b3343cf:  // QUIC v2
+        case 0x51303436:  // Q046
+        case 0x51303530:  // Q050
+        case 0x00000000:  // version negotiation
+            return true;
+        default:
+            return false;
+    }
 }
 
 std::vector<uint8_t> buildUdpResponse(const sockaddr* from, const uint8_t* data,
@@ -1011,10 +1030,10 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
         std::string responseError;
         if (waitForResponse(remoteFd, kResponseTimeoutMs, readable, responseError)) {
             verified = true;
-            if (m_selector) m_selector->markSuccess(host, strategyId);
             const long ms = static_cast<long>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - attemptStart).count());
+            if (m_selector) m_selector->markSuccess(host, strategyId, ms);
             const char* action = "split";
             if (choice.direct) {
                 action = "direct";
@@ -1084,7 +1103,8 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
         }
     }
 
-    relay(clientFd, remoteFd, host, request.port, !completeClientHello);
+    relay(clientFd, remoteFd, host, request.port, !completeClientHello,
+          completeClientHello ? kRelayTunnelIdleTimeoutMs : kRelayIdleTimeoutMs);
     closeTrackedFd(remoteFd);
 }
 
@@ -1118,7 +1138,11 @@ bool Socks5Server::createRemoteUdp(const std::string& host, uint16_t port,
         peer.key = udpKey(host, port);
         std::memcpy(&peer.addr, &addresses[i], sizeof(sockaddr_storage));
         peer.addrLen = lengths[i];
-        peer.fakesSent = false;
+        peer.strategyKey.clear();
+        peer.udpVerified = false;
+        peer.lastFakeAt = {};
+        peer.rxAtLastFake = 0;
+        peer.txAtLastFake = 0;
         trackFd(fd);
         return true;
     }
@@ -1171,6 +1195,11 @@ void Socks5Server::relayUdp(int clientFd, int relayFd) {
     uint64_t totalReceivedPackets = 0;
     uint64_t totalSentBytes = 0;
     uint64_t totalReceivedBytes = 0;
+    const std::shared_ptr<const Profile> profile =
+        m_selector ? m_selector->profile() : nullptr;
+    const bool blockQuic = profile && profile->quicFallback;
+    const auto fakeRetry = std::chrono::seconds(10);
+    const auto fakeRefresh = std::chrono::seconds(30);
 
     std::vector<uint8_t> packet(65535);
 
@@ -1249,11 +1278,20 @@ void Socks5Server::relayUdp(int clientFd, int relayFd) {
                             const uint16_t port =
                                 static_cast<uint16_t>((data[offset] << 8) | data[offset + 1]);
                             offset += 2;
+                            const std::string key = udpKey(host, port);
                             const uint8_t* payload = data + offset;
                             const std::size_t payloadLen =
                                 static_cast<std::size_t>(n) - offset;
 
-                            const std::string key = udpKey(host, port);
+                            if (blockQuic && port == 443 &&
+                                isQuicInitial(payload, payloadLen)) {
+                                if (shouldLogHost("quic:" + host)) {
+                                    emitEvent("[UDP-QUIC-BLOCK] %s forced TCP fallback",
+                                              formatEndpoint(host, port).c_str());
+                                }
+                                continue;
+                            }
+
                             auto it = peers.find(key);
                             if (it == peers.end()) {
                                 if (peers.size() >= kMaxUdpPeers) {
@@ -1279,22 +1317,52 @@ void Socks5Server::relayUdp(int clientFd, int relayFd) {
                             if (it != peers.end()) {
                                 UdpPeer& peer = it->second;
 
-                                if (!peer.fakesSent && port == 443 && m_selector) {
+                                const auto now = std::chrono::steady_clock::now();
+                                const bool fakePort = port == 443 || port >= 1024;
+                                const auto fakeInterval = peer.udpVerified
+                                    ? fakeRefresh
+                                    : fakeRetry;
+                                const bool fakeDue = peer.lastFakeAt.time_since_epoch().count() == 0 ||
+                                    now - peer.lastFakeAt >= fakeInterval;
+                                if (m_selector && fakePort && fakeDue) {
+                                    if (!peer.strategyKey.empty() && !peer.udpVerified &&
+                                        peer.receivedPackets == peer.rxAtLastFake &&
+                                        peer.sentPackets > peer.txAtLastFake) {
+                                        m_selector->markFailure(host, peer.strategyKey);
+                                        emitEvent("[UDP-FAIL] %s via %s",
+                                                  formatEndpoint(host, port).c_str(),
+                                                  peer.strategyKey.c_str());
+                                        peer.strategyKey.clear();
+                                    }
+
                                     const StrategyChoice choice =
                                         m_selector->select(host, true);
                                     if (choice.strategy && choice.strategy->udp.valid &&
                                         choice.strategy->udp.fakeCount > 0) {
+                                        UdpPlan plan = choice.strategy->udp;
+                                        if (port != 443 && plan.payload == "quic_google") {
+                                            plan.payload = "stun";
+                                        }
                                         DesyncEngine engine;
                                         const bool ok = engine.sendUdpFakes(
-                                            peer.fd, choice.strategy->udp,
-                                            nullptr, 0, choice.ttl);
+                                            peer.fd, plan, nullptr, 0, choice.ttl);
                                         if (!ok || shouldLogHost("udp:" + host)) {
                                             emitEvent("[UDP] %s via %s (%s)",
                                                       formatEndpoint(host, port).c_str(),
                                                       choice.key().c_str(),
                                                       ok ? "fake sent" : "fake failed");
                                         }
-                                        peer.fakesSent = true;
+                                        peer.strategyKey = choice.key();
+                                        peer.lastFakeAt = now;
+                                        peer.rxAtLastFake = peer.receivedPackets;
+                                        peer.txAtLastFake = peer.sentPackets;
+                                        if (ok) {
+                                            // Micro-jitter between fake and the real datagram.
+                                            const auto jitterUs =
+                                                (peer.sentPackets * 7919u + 137u) % 3000u;
+                                            std::this_thread::sleep_for(
+                                                std::chrono::microseconds(jitterUs));
+                                        }
                                     }
                                 }
 
@@ -1306,7 +1374,6 @@ void Socks5Server::relayUdp(int clientFd, int relayFd) {
                                     peer.sentBytes += static_cast<uint64_t>(sent);
                                     ++totalSentPackets;
                                     totalSentBytes += static_cast<uint64_t>(sent);
-                                    const auto now = std::chrono::steady_clock::now();
                                     if (peer.sentPackets == 1 ||
                                         now - peer.lastTxLog >= std::chrono::seconds(5)) {
                                         emitEvent("[UDP-TX] %s packets=%llu bytes=%llu last=%zu",
@@ -1366,6 +1433,14 @@ void Socks5Server::relayUdp(int clientFd, int relayFd) {
             ++totalReceivedPackets;
             totalReceivedBytes += static_cast<uint64_t>(n);
             const auto now = std::chrono::steady_clock::now();
+            if (!peer.udpVerified && !peer.strategyKey.empty() && m_selector) {
+                peer.udpVerified = true;
+                const long latencyMs = peer.lastFakeAt.time_since_epoch().count() == 0
+                    ? -1
+                    : static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                          now - peer.lastFakeAt).count());
+                m_selector->markSuccess(peer.host, peer.strategyKey, latencyMs);
+            }
             if (peer.receivedPackets == 1 ||
                 now - peer.lastRxLog >= std::chrono::seconds(5)) {
                 emitEvent("[UDP-RX] %s packets=%llu bytes=%llu last=%zd",
@@ -1401,12 +1476,13 @@ void Socks5Server::relayUdp(int clientFd, int relayFd) {
 }
 
 void Socks5Server::relay(int clientFd, int remoteFd, const std::string& host,
-                         uint16_t port, bool reportStream) {
+                         uint16_t port, bool reportStream, int idleTimeoutMs) {
     bool clientOpen = true;
     bool remoteOpen = true;
     uint64_t clientToServer = 0;
     uint64_t serverToClient = 0;
     uint8_t buffer[16384];
+    const int idleMs = idleTimeoutMs > 0 ? idleTimeoutMs : kRelayIdleTimeoutMs;
 
     while (m_running.load() && (clientOpen || remoteOpen)) {
         struct pollfd fds[2] = {
@@ -1416,7 +1492,7 @@ void Socks5Server::relay(int clientFd, int remoteFd, const std::string& host,
 
         int rc;
         do {
-            rc = ::poll(fds, 2, kRelayIdleTimeoutMs);
+            rc = ::poll(fds, 2, idleMs);
         } while (rc < 0 && errno == EINTR);
         if (rc == 0) break;
         if (rc < 0) break;
