@@ -564,7 +564,7 @@ void Socks5Server::handleClient(int clientFd) {
     Request request;
     uint8_t replyCode = SOCKS5_REP_FAILURE;
     if (!receiveRequest(clientFd, request, replyCode)) {
-        if (replyCode != SOCKS5_REP_SUCCESS) sendReply(clientFd, replyCode, nullptr, 0);
+        if (replyCode != SOCKS5_REP_SUCCESS) sendReply(clientFd, replyCode);
         return;
     }
 
@@ -573,7 +573,7 @@ void Socks5Server::handleClient(int clientFd) {
     } else if (request.command == SOCKS5_CMD_UDP_ASSOCIATE) {
         handleUdpAssociate(clientFd, request);
     } else {
-        sendReply(clientFd, SOCKS5_REP_CMD_UNSUPPORTED, nullptr, 0);
+        sendReply(clientFd, SOCKS5_REP_CMD_UNSUPPORTED);
     }
 }
 
@@ -610,21 +610,18 @@ bool Socks5Server::receiveRequest(int clientFd, Request& request, uint8_t& reply
         char text[INET_ADDRSTRLEN] = {};
         ::inet_ntop(AF_INET, ip, text, sizeof(text));
         request.host = text;
-        request.numeric = true;
     } else if (atyp == SOCKS5_ATYP_IPV6) {
         uint8_t ip[16];
         if (!recvAll(clientFd, ip, sizeof(ip))) return false;
         char text[INET6_ADDRSTRLEN] = {};
         ::inet_ntop(AF_INET6, ip, text, sizeof(text));
         request.host = text;
-        request.numeric = true;
     } else if (atyp == SOCKS5_ATYP_DOMAIN) {
         uint8_t length = 0;
         if (!recvAll(clientFd, &length, 1) || length == 0) return false;
         std::string domain(length, '\0');
         if (!recvAll(clientFd, reinterpret_cast<uint8_t*>(&domain[0]), length)) return false;
         request.host = std::move(domain);
-        request.numeric = isNumericHost(request.host);
     } else {
         replyCode = SOCKS5_REP_ATYP_UNSUPPORTED;
         return false;
@@ -633,14 +630,11 @@ bool Socks5Server::receiveRequest(int clientFd, Request& request, uint8_t& reply
     uint8_t portBytes[2];
     if (!recvAll(clientFd, portBytes, sizeof(portBytes))) return false;
     request.port = static_cast<uint16_t>((portBytes[0] << 8) | portBytes[1]);
-    request.udp = request.command == SOCKS5_CMD_UDP_ASSOCIATE;
-
     replyCode = SOCKS5_REP_SUCCESS;
     return true;
 }
 
-bool Socks5Server::sendReply(int clientFd, uint8_t rep, const struct sockaddr* bound,
-                             socklen_t boundLen) {
+bool Socks5Server::sendReply(int clientFd, uint8_t rep, const struct sockaddr* bound) {
     std::vector<uint8_t> reply;
     if (bound && bound->sa_family == AF_INET6) {
         reply = {SOCKS5_VERSION, rep, 0x00, SOCKS5_ATYP_IPV6};
@@ -661,7 +655,6 @@ bool Socks5Server::sendReply(int clientFd, uint8_t rep, const struct sockaddr* b
     } else {
         reply = {SOCKS5_VERSION, rep, 0x00, SOCKS5_ATYP_IPV4, 0, 0, 0, 0, 0, 0};
     }
-    (void)boundLen;
     return sendAll(clientFd, reply.data(), reply.size());
 }
 
@@ -687,6 +680,9 @@ bool Socks5Server::connectRemote(const std::string& host, uint16_t port, int& ou
         }
         if (m_protector && !m_protector(fd)) {
             SKY_LOGW("SOCKS5: protect(fd=%d) failed", fd);
+            ::close(fd);
+            error = "VpnService.protect failed";
+            continue;
         }
 
         if (!connectWithTimeout(fd,
@@ -857,12 +853,12 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
     std::string error;
     if (!connectRemote(request.host, request.port, remoteFd, nullptr, nullptr, error)) {
         SKY_LOGW("SOCKS5: CONNECT %s failed: %s", target.c_str(), error.c_str());
-        sendReply(clientFd, SOCKS5_REP_HOST_UNREACHABLE, nullptr, 0);
+        sendReply(clientFd, SOCKS5_REP_HOST_UNREACHABLE);
         return;
     }
     trackFd(remoteFd);
 
-    if (!sendReply(clientFd, SOCKS5_REP_SUCCESS, nullptr, 0)) {
+    if (!sendReply(clientFd, SOCKS5_REP_SUCCESS)) {
         closeTrackedFd(remoteFd);
         return;
     }
@@ -1123,6 +1119,9 @@ bool Socks5Server::createRemoteUdp(const std::string& host, uint16_t port,
         }
         if (m_protector && !m_protector(fd)) {
             SKY_LOGW("SOCKS5: protect(udp fd=%d) failed", fd);
+            ::close(fd);
+            error = "VpnService.protect failed";
+            continue;
         }
 
         if (::connect(fd, reinterpret_cast<const sockaddr*>(&addresses[i]),
@@ -1154,7 +1153,7 @@ void Socks5Server::handleUdpAssociate(int clientFd, const Request& request) {
     (void)request;
     const int relayFd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
     if (relayFd < 0) {
-        sendReply(clientFd, SOCKS5_REP_FAILURE, nullptr, 0);
+        sendReply(clientFd, SOCKS5_REP_FAILURE);
         return;
     }
     trackFd(relayFd);
@@ -1165,7 +1164,7 @@ void Socks5Server::handleUdpAssociate(int clientFd, const Request& request) {
     addr.sin_port = 0;
     if (::bind(relayFd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
         SKY_LOGE("SOCKS5: UDP relay bind failed: %s", std::strerror(errno));
-        sendReply(clientFd, SOCKS5_REP_FAILURE, nullptr, 0);
+        sendReply(clientFd, SOCKS5_REP_FAILURE);
         closeTrackedFd(relayFd);
         return;
     }
@@ -1175,7 +1174,7 @@ void Socks5Server::handleUdpAssociate(int clientFd, const Request& request) {
     setNonBlocking(relayFd, true);
 
     if (!sendReply(clientFd, SOCKS5_REP_SUCCESS,
-                   reinterpret_cast<struct sockaddr*>(&addr), boundLen)) {
+                   reinterpret_cast<struct sockaddr*>(&addr))) {
         emitEvent("[UDP-ASSOCIATE] failed to send relay address");
         closeTrackedFd(relayFd);
         return;

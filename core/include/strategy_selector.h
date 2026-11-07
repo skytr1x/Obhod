@@ -20,10 +20,6 @@ struct StrategyChoice {
     bool direct = false;
     bool tunnel = false;
 
-    bool valid() const {
-        return direct || tunnel || strategy != nullptr;
-    }
-
     std::string key() const {
         if (direct) return "direct";
         if (tunnel) return "tunnel";
@@ -35,10 +31,8 @@ struct StrategyChoice {
 
 class StrategySelector {
 public:
-    StrategySelector();
     explicit StrategySelector(std::shared_ptr<Profile> profile);
 
-    void setProfile(std::shared_ptr<Profile> profile);
     std::shared_ptr<const Profile> profile() const;
     StrategyChoice select(const std::string& host, bool udp = false) const;
     std::vector<StrategyChoice> candidates(const std::string& host, bool udp = false) const;
@@ -46,16 +40,11 @@ public:
     void markSuccess(const std::string& host, const std::string& strategyId,
                      long latencyMs = -1);
     void markFailure(const std::string& host, const std::string& strategyId);
-    void clearCache();
 
     void setCachePath(const std::string& basePath);
     std::size_t setNetworkKey(const std::string& networkKey);
-    std::size_t cacheSize() const;
 
     std::string cachedStrategy(const std::string& host) const;
-
-    bool isDirectHost(const std::string& host) const;
-    bool shouldInspect(const std::string& host) const;
 
 private:
     struct HostState {
@@ -85,14 +74,9 @@ private:
     std::string cacheFileLocked() const;
     void loadCacheLocked();
     void saveCacheLocked();
-    void clearCacheLocked(bool removeFile);
-    void remapCacheLocked();
-    bool strategyKnownLocked(const std::string& key) const;
     static double decayedFailures(const HostState::Metric& metric,
                                   std::chrono::steady_clock::time_point now);
 };
-
-const char* actionTypeName(ActionType type);
 
 }
 

@@ -25,15 +25,10 @@ public final class NativeBridge {
     public static native void start(long handle);
     public static native void stop(long handle);
     public static native void destroy(long handle);
-    public static native void setTunFd(long handle, int fd);
-    public static native void setStrategyProfile(long handle, String profileJson);
     public static native void setNetworkKey(long handle, String networkKey);
     public static native String getStatsJson(long handle);
-    public static native String probeNetwork(long handle);
-    public static native String probeHost(long handle, String host, int port);
     public static native boolean startTunnel(int tunFd, String configPath);
     public static native void stopTunnel();
-    public static native boolean isTunnelRunning();
 
     private NativeBridge() {}
 }

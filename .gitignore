@@ -6,6 +6,7 @@ build/
 local.properties
 
 .cxx/
+native/tgwsproxy/target/
 
 .DS_Store
 Thumbs.db

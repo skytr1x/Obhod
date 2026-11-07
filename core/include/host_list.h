@@ -11,11 +11,10 @@ public:
     HostList() = default;
 
     void add(const std::string& pattern);
-    void addText(const std::string& text); // newline/space separated
+    void addText(const std::string& text);
     void clear();
     bool empty() const { return m_patterns.empty(); }
     bool matches(const std::string& host) const;
-    std::size_t size() const { return m_patterns.size(); }
 
 private:
     struct Pattern {

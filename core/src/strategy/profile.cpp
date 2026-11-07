@@ -386,7 +386,6 @@ std::shared_ptr<Profile> parseProfile(const std::string& text, std::string& erro
     }
 
     auto profile = std::make_shared<Profile>();
-    profile->version = getInt(&root, "version", 1);
     profile->updated = getString(&root, "updated", "");
     profile->socksPort = getInt(&root, "socks_port", 10800);
     profile->defaultTtl = getInt(&root, "default_ttl", 64);
@@ -498,7 +497,6 @@ std::shared_ptr<Profile> parseProfile(const std::string& text, std::string& erro
         return nullptr;
     }
 
-    profile->valid = true;
     error.clear();
     return profile;
 }
@@ -508,17 +506,6 @@ const StrategyDef* Profile::findStrategy(const std::string& id) const {
         if (strategy.id == id) return &strategy;
     }
     return nullptr;
-}
-
-std::vector<const StrategyDef*> Profile::orderedStrategies() const {
-    std::vector<const StrategyDef*> out;
-    out.reserve(strategies.size());
-    for (const auto& strategy : strategies) out.push_back(&strategy);
-    std::stable_sort(out.begin(), out.end(),
-                     [](const StrategyDef* a, const StrategyDef* b) {
-                         return a->cost < b->cost;
-                     });
-    return out;
 }
 
 std::string Profile::ruleStrategy(const std::string& host) const {
@@ -535,7 +522,6 @@ std::string Profile::ruleStrategy(const std::string& host) const {
 
 std::shared_ptr<Profile> defaultProfile() {
     auto profile = std::make_shared<Profile>();
-    profile->version = 1;
     profile->updated = "builtin";
     profile->defaultTtl = 64;
     profile->tcpNodelay = true;
@@ -621,7 +607,6 @@ std::shared_ptr<Profile> defaultProfile() {
     }
 
     profile->defaultTcp = {"fake-sni", "split-sni", "split-1", "tlsrec-sni", "disorder-1"};
-    profile->valid = true;
     return profile;
 }
 

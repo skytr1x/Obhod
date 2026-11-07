@@ -84,26 +84,8 @@ std::vector<int> ttlValuesFor(const StrategyDef* strategy, bool udp) {
 
 }
 
-StrategySelector::StrategySelector() : m_profile(defaultProfile()) {}
-
 StrategySelector::StrategySelector(std::shared_ptr<Profile> profile)
     : m_profile(profile ? std::move(profile) : defaultProfile()) {}
-
-void StrategySelector::setProfile(std::shared_ptr<Profile> profile) {
-    if (!profile) return;
-    std::shared_ptr<Profile> applied;
-    std::size_t cached = 0;
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_profile = std::move(profile);
-        applied = m_profile;
-        remapCacheLocked();
-        cached = m_cache.size();
-    }
-    SKY_LOGI("StrategySelector: profile '%s' applied (%zu strategies, %zu rules, %zu cached hosts)",
-             applied->updated.c_str(), applied->strategies.size(),
-             applied->rules.size(), cached);
-}
 
 std::shared_ptr<const Profile> StrategySelector::profile() const {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -130,11 +112,6 @@ std::size_t StrategySelector::setNetworkKey(const std::string& networkKey) {
         m_cache.clear();
     }
     loadCacheLocked();
-    return m_cache.size();
-}
-
-std::size_t StrategySelector::cacheSize() const {
-    std::lock_guard<std::mutex> lock(m_mutex);
     return m_cache.size();
 }
 
@@ -204,57 +181,12 @@ void StrategySelector::saveCacheLocked() {
     }
 }
 
-void StrategySelector::clearCacheLocked(bool removeFile) {
-    m_cache.clear();
-    if (removeFile && !m_cacheBasePath.empty()) {
-        const std::string path = cacheFileLocked();
-        if (!path.empty()) ::unlink(path.c_str());
-    }
-}
-
 double StrategySelector::decayedFailures(const HostState::Metric& metric,
                                          std::chrono::steady_clock::time_point now) {
     if (metric.failures <= 0.0) return 0.0;
     const double ageHours =
         std::chrono::duration<double, std::ratio<3600>>(now - metric.failedAt).count();
     return metric.failures * std::exp2(-ageHours / kFailureHalfLifeHours);
-}
-
-bool StrategySelector::strategyKnownLocked(const std::string& key) const {
-    if (key == "direct" || key == "tunnel" || key == "none") return true;
-    if (!m_profile) return false;
-    const std::string id = key.substr(0, key.find('@'));
-    return m_profile->findStrategy(id) != nullptr;
-}
-
-void StrategySelector::remapCacheLocked() {
-    std::size_t droppedPreferred = 0;
-    std::size_t droppedMetrics = 0;
-    for (auto stateIt = m_cache.begin(); stateIt != m_cache.end();) {
-        HostState& state = stateIt->second;
-        if (!state.preferred.empty() && !strategyKnownLocked(state.preferred)) {
-            state.preferred.clear();
-            ++droppedPreferred;
-        }
-        for (auto metricIt = state.metrics.begin(); metricIt != state.metrics.end();) {
-            if (!strategyKnownLocked(metricIt->first)) {
-                metricIt = state.metrics.erase(metricIt);
-                ++droppedMetrics;
-            } else {
-                ++metricIt;
-            }
-        }
-        if (state.preferred.empty() && state.metrics.empty()) {
-            stateIt = m_cache.erase(stateIt);
-        } else {
-            ++stateIt;
-        }
-    }
-    saveCacheLocked();
-    if (droppedPreferred > 0 || droppedMetrics > 0) {
-        SKY_LOGI("StrategySelector: profile remap dropped %zu cached strategies, %zu metrics",
-                 droppedPreferred, droppedMetrics);
-    }
 }
 
 bool StrategySelector::isUsable(const StrategyDef* strategy, bool udp) {
@@ -549,11 +481,6 @@ void StrategySelector::markFailure(const std::string& rawHost, const std::string
              strategyId.c_str(), host.c_str(), metric.failures);
 }
 
-void StrategySelector::clearCache() {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    clearCacheLocked(true);
-}
-
 std::string StrategySelector::cachedStrategy(const std::string& rawHost) const {
     const std::string host = normalizeHost(rawHost);
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -561,36 +488,6 @@ std::string StrategySelector::cachedStrategy(const std::string& rawHost) const {
     if (it == m_cache.end()) return {};
     if (std::chrono::steady_clock::now() - it->second.updated >= kCacheTtl) return {};
     return it->second.preferred;
-}
-
-bool StrategySelector::isDirectHost(const std::string& rawHost) const {
-    const std::string host = normalizeHost(rawHost);
-    std::lock_guard<std::mutex> lock(m_mutex);
-    if (!m_profile || host.empty()) return true;
-
-    const std::string rule = m_profile->ruleStrategy(host);
-    if (isDirectId(rule)) return true;
-    if (isTunnelId(rule)) return false;
-    if (!rule.empty()) return false;
-    if (m_profile->exclude.matches(host)) return true;
-    if (m_profile->directRu && isRussianDomain(host)) return true;
-    if (!m_profile->include.empty() && !m_profile->include.matches(host)) return true;
-    return false;
-}
-
-bool StrategySelector::shouldInspect(const std::string& host) const {
-    return !isDirectHost(host);
-}
-
-const char* actionTypeName(ActionType type) {
-    switch (type) {
-        case ActionType::SPLIT:    return "split";
-        case ActionType::DISORDER: return "disorder";
-        case ActionType::FAKE:     return "fake";
-        case ActionType::TLS_REC:  return "tlsrec";
-        case ActionType::OOB:      return "oob";
-    }
-    return "unknown";
 }
 
 }

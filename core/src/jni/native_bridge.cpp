@@ -225,30 +225,6 @@ Java_com_skytr1x_obhod_NativeBridge_destroy(JNIEnv* env, jclass clazz, jlong han
 }
 
 JNIEXPORT void JNICALL
-Java_com_skytr1x_obhod_NativeBridge_setTunFd(JNIEnv* env, jclass clazz, jlong handle, jint fd) {
-    LOGD("JNI: setTunFd() called with handle %p and fd %d", (void*)handle, fd);
-    auto core = reinterpret_cast<skyunblock::SkyCore*>(handle);
-    if (core) {
-        core->setTunFd(fd);
-    } else {
-        LOGE("JNI: setTunFd() failed - null handle");
-    }
-}
-
-JNIEXPORT void JNICALL
-Java_com_skytr1x_obhod_NativeBridge_setStrategyProfile(JNIEnv* env, jclass clazz, jlong handle, jstring profileJson) {
-    LOGD("JNI: setStrategyProfile() called");
-    auto core = reinterpret_cast<skyunblock::SkyCore*>(handle);
-    if (!core || !profileJson) return;
-
-    const char* json = env->GetStringUTFChars(profileJson, nullptr);
-    if (json) {
-        core->setStrategyProfile(std::string(json));
-        env->ReleaseStringUTFChars(profileJson, json);
-    }
-}
-
-JNIEXPORT void JNICALL
 Java_com_skytr1x_obhod_NativeBridge_setNetworkKey(JNIEnv* env, jclass clazz, jlong handle,
                                                jstring networkKey) {
     auto core = reinterpret_cast<skyunblock::SkyCore*>(handle);
@@ -272,30 +248,6 @@ Java_com_skytr1x_obhod_NativeBridge_getStatsJson(JNIEnv* env, jclass clazz, jlon
 
     std::string stats = core->getStatsJson();
     return env->NewStringUTF(stats.c_str());
-}
-
-JNIEXPORT jstring JNICALL
-Java_com_skytr1x_obhod_NativeBridge_probeNetwork(JNIEnv* env, jclass clazz, jlong handle) {
-    auto core = reinterpret_cast<skyunblock::SkyCore*>(handle);
-    if (!core) return nullptr;
-
-    std::string result = core->probeNetwork();
-    return env->NewStringUTF(result.c_str());
-}
-
-JNIEXPORT jstring JNICALL
-Java_com_skytr1x_obhod_NativeBridge_probeHost(JNIEnv* env, jclass clazz, jlong handle,
-                                           jstring host, jint port) {
-    auto core = reinterpret_cast<skyunblock::SkyCore*>(handle);
-    if (!core || !host) return nullptr;
-
-    const char* text = env->GetStringUTFChars(host, nullptr);
-    if (!text) return nullptr;
-    std::string target(text);
-    env->ReleaseStringUTFChars(host, text);
-
-    std::string result = core->probeHost(target, port);
-    return env->NewStringUTF(result.c_str());
 }
 
 }

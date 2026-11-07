@@ -21,8 +21,6 @@ public:
     JsonValue() = default;
     explicit JsonValue(bool v) : type(Type::Bool), boolValue(v) {}
     explicit JsonValue(double v) : type(Type::Number), numberValue(v) {}
-    explicit JsonValue(int v) : type(Type::Number), numberValue(static_cast<double>(v)) {}
-    explicit JsonValue(const char* v) : type(Type::String), stringValue(v) {}
     explicit JsonValue(std::string v) : type(Type::String), stringValue(std::move(v)) {}
 
     bool isNull() const { return type == Type::Null; }
@@ -33,11 +31,6 @@ public:
     bool isBool() const { return type == Type::Bool; }
 
     const JsonValue* find(const std::string& key) const;
-    const JsonValue* at(std::size_t index) const;
-
-    std::string asString(const std::string& defaultValue = std::string()) const;
-    int asInt(int defaultValue = 0) const;
-    bool asBool(bool defaultValue = false) const;
 
     std::vector<std::string> asStringList() const;
 };

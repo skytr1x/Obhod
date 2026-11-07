@@ -6,7 +6,6 @@
 #include <sstream>
 
 #include "json.h"
-#include "prober.h"
 #include "sky_log.h"
 
 namespace skyunblock {
@@ -96,11 +95,7 @@ void SkyCore::start() {
         return;
     }
 
-    std::shared_ptr<Profile> profile;
-    {
-        std::lock_guard<std::mutex> lock(m_profileMutex);
-        profile = m_profile;
-    }
+    const std::shared_ptr<Profile>& profile = m_profile;
     updateState(State::RUNNING,
                 "SkyCore running - SOCKS5 on 127.0.0.1:" +
                     std::to_string(m_socksPort.load()) + " (profile: " +
@@ -115,45 +110,8 @@ void SkyCore::stop() {
     updateState(State::IDLE, "SkyCore stopped");
 }
 
-void SkyCore::setTunFd(int fd) {
-    m_tunFd = fd;
-    SKY_LOGD("SkyCore: TUN fd set to %d (tun2socks routes to port %d)",
-             fd, m_socksPort.load());
-}
-
-void SkyCore::setStrategyProfile(const std::string& profileJson) {
-    std::string error;
-    std::shared_ptr<Profile> parsed = parseProfile(profileJson, error);
-    if (!parsed) {
-        SKY_LOGE("SkyCore: setStrategyProfile rejected: %s", error.c_str());
-        updateState(State::DEGRADED, "Strategy profile rejected: " + error);
-        return;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(m_profileMutex);
-        m_profile = parsed;
-    }
-    m_selector->setProfile(parsed);
-
-    const int newPort = parsed->socksPort;
-    const int oldPort = m_socksPort.exchange(newPort);
-    if (oldPort != newPort) {
-        SKY_LOGW("SkyCore: SOCKS5 port change %d -> %d takes effect after restart",
-                 oldPort, newPort);
-    }
-
-    updateState(State::RUNNING,
-                "Strategy profile applied: " + parsed->updated + " (" +
-                    std::to_string(parsed->strategies.size()) + " strategies)");
-}
-
 std::string SkyCore::getStatsJson() {
-    std::shared_ptr<Profile> profile;
-    {
-        std::lock_guard<std::mutex> lock(m_profileMutex);
-        profile = m_profile;
-    }
+    const std::shared_ptr<Profile>& profile = m_profile;
     std::ostringstream ss;
     const int actualPort = m_socks5Server.isRunning()
                                ? static_cast<int>(m_socks5Server.port())
@@ -171,21 +129,7 @@ std::string SkyCore::getStatsJson() {
     return ss.str();
 }
 
-std::string SkyCore::probeNetwork() {
-    return probeHost("www.google.com", 443);
-}
-
-std::string SkyCore::probeHost(const std::string& host, int port) {
-    if (host.empty()) {
-        return "{\"success\":false,\"strategy\":\"none\","
-               "\"error\":\"empty host\"}";
-    }
-    Prober prober(m_selector.get(), m_protector, 5000, 7000, m_event);
-    return prober.probeJson(host, port > 0 ? port : 443);
-}
-
 void SkyCore::updateState(State newState, const std::string& message) {
-    m_state = newState;
     SKY_LOGI("SkyCore state %d: %s", static_cast<int>(newState), message.c_str());
     if (m_listener) {
         m_listener(static_cast<int>(newState), message);

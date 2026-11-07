@@ -60,7 +60,6 @@ struct HostRule {
 };
 
 struct Profile {
-    int version = 1;
     std::string updated;
     int socksPort = 10800;
     int defaultTtl = 64;
@@ -77,10 +76,7 @@ struct Profile {
     std::vector<std::string> defaultTcp;
     std::vector<std::string> defaultUdp;
 
-    bool valid = false;
-
     const StrategyDef* findStrategy(const std::string& id) const;
-    std::vector<const StrategyDef*> orderedStrategies() const;
     std::string ruleStrategy(const std::string& host) const;
 };
 

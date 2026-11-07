@@ -50,7 +50,6 @@ set(SOURCES
     src/socks/socks5_server.cpp
     src/desync/desync_engine.cpp
     src/desync/tls_utils.cpp
-    src/probe/prober.cpp
     src/strategy/fake_payloads.cpp
     src/strategy/profile.cpp
     src/strategy/strategy_selector.cpp

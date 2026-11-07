@@ -44,8 +44,6 @@ private:
         uint8_t command = 0;
         std::string host;
         uint16_t port = 0;
-        bool numeric = false;
-        bool udp = false;
     };
 
     struct UdpPeer {
@@ -74,7 +72,7 @@ private:
     void handleUdpAssociate(int clientFd, const Request& request);
 
     bool receiveRequest(int clientFd, Request& request, uint8_t& replyCode);
-    bool sendReply(int clientFd, uint8_t rep, const struct sockaddr* bound, socklen_t boundLen);
+    bool sendReply(int clientFd, uint8_t rep, const struct sockaddr* bound = nullptr);
 
     void trackFd(int fd);
     void untrackFd(int fd);

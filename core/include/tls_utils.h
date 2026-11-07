@@ -28,9 +28,6 @@ bool resolvePosition(const std::string& spec, const PayloadInfo& info,
                      std::size_t len, std::size_t& out);
 
 bool tlsRecordSplit(std::vector<std::uint8_t>& data, std::size_t pos);
-std::vector<std::uint8_t> buildClientHello(const std::string& host);
-
-std::string toLowerAscii(std::string value);
 
 }
 

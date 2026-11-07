@@ -39,7 +39,6 @@ private:
             if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
                 ++m_pos;
             } else if (c == '/' && m_pos + 1 < m_text.size() && m_text[m_pos + 1] == '/') {
-                // Tolerate // comments in hand-edited profiles.
                 m_pos += 2;
                 while (m_pos < m_text.size() && m_text[m_pos] != '\n') ++m_pos;
             } else if (c == '/' && m_pos + 1 < m_text.size() && m_text[m_pos + 1] == '*') {
@@ -97,7 +96,7 @@ private:
     }
 
     bool parseObject(JsonValue& out) {
-        ++m_pos; // {
+        ++m_pos;
         out.type = JsonValue::Type::Object;
         skipWhitespace();
         if (m_pos < m_text.size() && m_text[m_pos] == '}') {
@@ -130,7 +129,7 @@ private:
     }
 
     bool parseArray(JsonValue& out) {
-        ++m_pos; // [
+        ++m_pos;
         out.type = JsonValue::Type::Array;
         skipWhitespace();
         if (m_pos < m_text.size() && m_text[m_pos] == ']') {
@@ -179,7 +178,7 @@ private:
                         unsigned int cp = 0;
                         if (!parseHex4(cp)) return false;
                         if (cp >= 0xD800 && cp <= 0xDBFF) {
-                            // Surrogate pair.
+                            // surrogate pair
                             if (m_pos + 1 < m_text.size() && m_text[m_pos] == '\\' &&
                                 m_text[m_pos + 1] == 'u') {
                                 m_pos += 2;
@@ -272,32 +271,12 @@ private:
     }
 };
 
-} // namespace
+}
 
 const JsonValue* JsonValue::find(const std::string& key) const {
     if (type != Type::Object) return nullptr;
     auto it = objectValue.find(key);
     return it == objectValue.end() ? nullptr : &it->second;
-}
-
-const JsonValue* JsonValue::at(std::size_t index) const {
-    if (type != Type::Array || index >= arrayValue.size()) return nullptr;
-    return &arrayValue[index];
-}
-
-std::string JsonValue::asString(const std::string& defaultValue) const {
-    return type == Type::String ? stringValue : defaultValue;
-}
-
-int JsonValue::asInt(int defaultValue) const {
-    if (type != Type::Number) return defaultValue;
-    return static_cast<int>(numberValue);
-}
-
-bool JsonValue::asBool(bool defaultValue) const {
-    if (type == Type::Bool) return boolValue;
-    if (type == Type::Number) return numberValue != 0.0;
-    return defaultValue;
 }
 
 std::vector<std::string> JsonValue::asStringList() const {
@@ -348,4 +327,4 @@ std::string jsonEscape(const std::string& value) {
     return out;
 }
 
-} // namespace skyunblock
+}

@@ -5,7 +5,6 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
-#include <random>
 
 #include "sky_log.h"
 
@@ -15,17 +14,6 @@ namespace {
 
 std::uint16_t readU16(const std::uint8_t* p) {
     return static_cast<std::uint16_t>((static_cast<std::uint16_t>(p[0]) << 8) | p[1]);
-}
-
-void writeU16(std::vector<std::uint8_t>& out, std::uint16_t v) {
-    out.push_back(static_cast<std::uint8_t>(v >> 8));
-    out.push_back(static_cast<std::uint8_t>(v & 0xff));
-}
-
-void writeU24(std::vector<std::uint8_t>& out, std::uint32_t v) {
-    out.push_back(static_cast<std::uint8_t>((v >> 16) & 0xff));
-    out.push_back(static_cast<std::uint8_t>((v >> 8) & 0xff));
-    out.push_back(static_cast<std::uint8_t>(v & 0xff));
 }
 
 bool isHttpMethod(const std::uint8_t* data, std::size_t len) {
@@ -191,22 +179,6 @@ std::size_t midSldOffset(const std::string& host) {
     return start + sldLen / 2;
 }
 
-std::vector<std::uint8_t> makeRandom(std::size_t n) {
-    std::vector<std::uint8_t> out(n);
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<int> dist(0, 255);
-    for (auto& b : out) b = static_cast<std::uint8_t>(dist(gen));
-    return out;
-}
-
-}
-
-std::string toLowerAscii(std::string value) {
-    for (char& c : value) {
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    }
-    return value;
 }
 
 PayloadInfo analyzePayload(const std::uint8_t* data, std::size_t len) {
@@ -299,110 +271,6 @@ bool tlsRecordSplit(std::vector<std::uint8_t>& data, std::size_t pos) {
     data[pos + 4] = static_cast<std::uint8_t>(secondLen & 0xff);
 
     return true;
-}
-
-std::vector<std::uint8_t> buildClientHello(const std::string& host) {
-    std::vector<std::uint8_t> body;
-    body.reserve(256);
-
-    // legacy_version
-    body.push_back(0x03);
-    body.push_back(0x03);
-
-    // random
-    const auto random = makeRandom(32);
-    body.insert(body.end(), random.begin(), random.end());
-
-    // legacy_session_id: empty is allowed.
-    body.push_back(0x00);
-
-    // cipher suites
-    writeU16(body, 8);
-    writeU16(body, 0x1301); // TLS_AES_128_GCM_SHA256
-    writeU16(body, 0x1302); // TLS_AES_256_GCM_SHA384
-    writeU16(body, 0xc02f); // ECDHE_RSA_AES128_GCM_SHA256
-    writeU16(body, 0xc030); // ECDHE_RSA_AES256_GCM_SHA384
-
-    // compression methods
-    body.push_back(0x01);
-    body.push_back(0x00);
-
-    // extensions
-    std::vector<std::uint8_t> ext;
-
-    // server_name
-    {
-        const std::size_t hostLen = host.size();
-        writeU16(ext, 0x0000);
-        writeU16(ext, static_cast<std::uint16_t>(2 + 1 + 2 + hostLen));
-        writeU16(ext, static_cast<std::uint16_t>(1 + 2 + hostLen));
-        ext.push_back(0x00);
-        writeU16(ext, static_cast<std::uint16_t>(hostLen));
-        ext.insert(ext.end(), host.begin(), host.end());
-    }
-
-    // supported_groups: x25519, secp256r1
-    writeU16(ext, 0x000a);
-    writeU16(ext, 6);
-    writeU16(ext, 4);
-    writeU16(ext, 0x001d);
-    writeU16(ext, 0x0017);
-
-    // ec_point_formats: uncompressed
-    writeU16(ext, 0x000b);
-    writeU16(ext, 2);
-    ext.push_back(0x01);
-    ext.push_back(0x00);
-
-    // signature_algorithms
-    writeU16(ext, 0x000d);
-    writeU16(ext, 10);
-    writeU16(ext, 8);
-    writeU16(ext, 0x0403); // ecdsa_secp256r1_sha256
-    writeU16(ext, 0x0804); // rsa_pss_rsae_sha256
-    writeU16(ext, 0x0401); // rsa_pkcs1_sha256
-    writeU16(ext, 0x0503); // ecdsa_secp384r1_sha384
-
-    // supported_versions
-    writeU16(ext, 0x002b);
-    writeU16(ext, 5);
-    ext.push_back(0x04);
-    writeU16(ext, 0x0304);
-    writeU16(ext, 0x0303);
-
-    // key_share: x25519
-    {
-        const auto key = makeRandom(32);
-        writeU16(ext, 0x0033);
-        writeU16(ext, 38);
-        writeU16(ext, 36);
-        writeU16(ext, 0x001d);
-        writeU16(ext, 32);
-        ext.insert(ext.end(), key.begin(), key.end());
-    }
-
-    writeU16(ext, 0x0010);
-    writeU16(ext, 14);
-    writeU16(ext, 12);
-    ext.push_back(0x02);
-    ext.push_back('h');
-    ext.push_back('2');
-    ext.push_back(0x08);
-    ext.insert(ext.end(), {'h', 't', 't', 'p', '/', '1', '.', '1'});
-
-    writeU16(body, static_cast<std::uint16_t>(ext.size()));
-    body.insert(body.end(), ext.begin(), ext.end());
-
-    std::vector<std::uint8_t> out;
-    out.reserve(body.size() + 9);
-    out.push_back(0x16);
-    out.push_back(0x03);
-    out.push_back(0x01);
-    writeU16(out, static_cast<std::uint16_t>(body.size() + 4));
-    out.push_back(0x01);
-    writeU24(out, static_cast<std::uint32_t>(body.size()));
-    out.insert(out.end(), body.begin(), body.end());
-    return out;
 }
 
 }

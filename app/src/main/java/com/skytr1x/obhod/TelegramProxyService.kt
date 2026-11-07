@@ -18,7 +18,6 @@ class TelegramProxyService : Service() {
         const val ACTION_START = "com.skytr1x.obhod.telegram.START"
         const val ACTION_STOP = "com.skytr1x.obhod.telegram.STOP"
         const val ACTION_STATE_CHANGED = "com.skytr1x.obhod.telegram.STATE_CHANGED"
-        const val EXTRA_RUNNING = "running"
         private const val CHANNEL_ID = "telegram_proxy"
         private const val NOTIFICATION_ID = 41
         private const val TAG = "TelegramProxyService"
@@ -108,7 +107,7 @@ class TelegramProxyService : Service() {
 
     private fun publishState(value: Boolean) {
         getSharedPreferences("telegram_proxy", MODE_PRIVATE).edit().putBoolean("running", value).apply()
-        sendBroadcast(Intent(ACTION_STATE_CHANGED).setPackage(packageName).putExtra(EXTRA_RUNNING, value))
+        sendBroadcast(Intent(ACTION_STATE_CHANGED).setPackage(packageName))
     }
 
     override fun onDestroy() {
