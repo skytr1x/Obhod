@@ -26,9 +26,11 @@ public:
     using ProtectorCallback = std::function<bool(int)>;
     using ListenerCallback  = std::function<void(int, const std::string&)>;
     using EventCallback     = std::function<void(const std::string&)>;
+    using DnsResolverCallback = Socks5Server::DnsResolverCallback;
 
     SkyCore(const std::string& configPath, ProtectorCallback protector,
-            ListenerCallback listener, EventCallback event = nullptr);
+            ListenerCallback listener, EventCallback event = nullptr,
+            DnsResolverCallback dnsResolver = nullptr);
     ~SkyCore();
 
     void start();
@@ -42,6 +44,7 @@ private:
     ProtectorCallback m_protector;
     ListenerCallback m_listener;
     EventCallback m_event;
+    DnsResolverCallback m_dnsResolver;
 
     std::shared_ptr<Profile> m_profile;
     std::unique_ptr<StrategySelector> m_selector;

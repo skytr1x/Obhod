@@ -115,7 +115,9 @@ fun ObhodApp(
     onTacticHelpAccepted: () -> Unit,
     updatingDomainList: Boolean,
     domainListStatus: String,
-    onUpdateDomainList: () -> Unit
+    onUpdateDomainList: () -> Unit,
+    batteryOptimizationIgnored: Boolean,
+    onRequestBatteryOptimization: () -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -165,6 +167,8 @@ fun ObhodApp(
                         updatingDomainList = updatingDomainList,
                         domainListStatus = domainListStatus,
                         onUpdateDomainList = onUpdateDomainList,
+                        batteryOptimizationIgnored = batteryOptimizationIgnored,
+                        onRequestBatteryOptimization = onRequestBatteryOptimization,
                         onToggle = onToggle,
                         onCopyText = copyText
                     )
@@ -340,6 +344,8 @@ private fun HomeScreen(
     updatingDomainList: Boolean,
     domainListStatus: String,
     onUpdateDomainList: () -> Unit,
+    batteryOptimizationIgnored: Boolean,
+    onRequestBatteryOptimization: () -> Unit,
     onToggle: () -> Unit,
     onCopyText: (String) -> Unit
 ) {
@@ -387,6 +393,11 @@ private fun HomeScreen(
             domainListStatus = domainListStatus,
             onUpdateDomainList = onUpdateDomainList
         )
+        Spacer(Modifier.height(16.dp))
+        BatterySettingsCard(
+            batteryOptimizationIgnored = batteryOptimizationIgnored,
+            onRequestBatteryOptimization = onRequestBatteryOptimization
+        )
         Spacer(Modifier.height(32.dp))
     }
 
@@ -394,6 +405,74 @@ private fun HomeScreen(
         ProxyDialog(
             onDismiss = { showProxyDialog = false },
             onCopyText = onCopyText
+        )
+    }
+}
+
+@Composable
+private fun BatterySettingsCard(
+    batteryOptimizationIgnored: Boolean,
+    onRequestBatteryOptimization: () -> Unit
+) {
+    var showAutostartHelp by rememberSaveable { mutableStateOf(false) }
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.large,
+        color = MaterialTheme.colorScheme.surfaceContainerHigh
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Text(
+                text = "Работа в фоне",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = if (batteryOptimizationIgnored) {
+                    "Ограничение батареи снято. На некоторых телефонах отдельно нужен автозапуск."
+                } else {
+                    "Отключение ограничения батареи поможет держать Обход активным."
+                },
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.height(12.dp))
+            if (!batteryOptimizationIgnored) {
+                FilledTonalButton(
+                    onClick = onRequestBatteryOptimization,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Разрешить работу без ограничений")
+                }
+                Spacer(Modifier.height(4.dp))
+            }
+            TextButton(
+                onClick = { showAutostartHelp = true },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Как включить автозапуск")
+            }
+        }
+    }
+
+    if (showAutostartHelp) {
+        AlertDialog(
+            onDismissRequest = { showAutostartHelp = false },
+            title = { Text("Автозапуск и фоновые ограничения") },
+            text = {
+                Text(
+                    "На Xiaomi, Huawei, Samsung и других телефонах откройте настройки " +
+                        "приложения Obhod и разрешите фоновую работу или автозапуск. " +
+                        "Названия пунктов отличаются; обычно они находятся в разделах " +
+                        "\"Батарея\", \"Запуск приложений\" или \"Автозапуск\"."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = { showAutostartHelp = false }) {
+                    Text("Понятно")
+                }
+            }
         )
     }
 }

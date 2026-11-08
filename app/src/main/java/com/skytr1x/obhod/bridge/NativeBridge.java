@@ -19,6 +19,7 @@ public final class NativeBridge {
     public interface Listener {
         void onState(int state, String message);
         void onEvent(String message);
+        byte[] resolveDns(byte[] query);
     }
 
     public static native long create(String configPath, Protector protector, Listener listener);

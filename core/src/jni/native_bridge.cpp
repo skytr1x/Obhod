@@ -1,6 +1,9 @@
 #include <jni.h>
 #include <string>
 #include <memory>
+#include <limits>
+#include <vector>
+#include <cstdint>
 #include "skycore.h"
 #include <mutex>
 #include <android/log.h>
@@ -181,9 +184,55 @@ Java_com_skytr1x_obhod_bridge_NativeBridge_create(JNIEnv* env, jclass clazz, jst
         env->DeleteLocalRef(listenerClass);
     };
 
+    auto dnsResolverCb = [refs](const std::vector<std::uint8_t>& query)
+        -> std::vector<std::uint8_t> {
+        JNIEnv* env = getJNIEnv();
+        if (!env || !refs->listener ||
+            query.size() > static_cast<std::size_t>(std::numeric_limits<jsize>::max())) {
+            return {};
+        }
+        jclass listenerClass = env->GetObjectClass(refs->listener);
+        if (!listenerClass) return {};
+        jmethodID resolveMethod =
+            env->GetMethodID(listenerClass, "resolveDns", "([B)[B");
+        if (!resolveMethod) {
+            env->DeleteLocalRef(listenerClass);
+            return {};
+        }
+        jbyteArray request = env->NewByteArray(static_cast<jsize>(query.size()));
+        if (!request) {
+            env->DeleteLocalRef(listenerClass);
+            return {};
+        }
+        env->SetByteArrayRegion(
+            request, 0, static_cast<jsize>(query.size()),
+            reinterpret_cast<const jbyte*>(query.data()));
+        auto response = static_cast<jbyteArray>(
+            env->CallObjectMethod(refs->listener, resolveMethod, request));
+        std::vector<std::uint8_t> result;
+        if (!env->ExceptionCheck() && response) {
+            const jsize length = env->GetArrayLength(response);
+            if (length > 0 && length <= 65535) {
+                result.resize(static_cast<std::size_t>(length));
+                env->GetByteArrayRegion(
+                    response, 0, length, reinterpret_cast<jbyte*>(result.data()));
+            }
+        }
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+            result.clear();
+        }
+        if (response) env->DeleteLocalRef(response);
+        env->DeleteLocalRef(request);
+        env->DeleteLocalRef(listenerClass);
+        return result;
+    };
+
     LOGD("JNI: Creating SkyCore instance...");
     try {
-        auto core = new skyunblock::SkyCore(cppPath, protectorCb, listenerCb, eventCb);
+        auto core = new skyunblock::SkyCore(
+            cppPath, protectorCb, listenerCb, eventCb, dnsResolverCb);
         LOGD("JNI: SkyCore instance created at %p", core);
         return reinterpret_cast<jlong>(core);
     } catch (const std::exception& e) {

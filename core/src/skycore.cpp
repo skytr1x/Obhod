@@ -11,11 +11,13 @@
 namespace skyunblock {
 
 SkyCore::SkyCore(const std::string& configPath, ProtectorCallback protector,
-                 ListenerCallback listener, EventCallback event)
+                 ListenerCallback listener, EventCallback event,
+                 DnsResolverCallback dnsResolver)
     : m_configPath(configPath),
       m_protector(std::move(protector)),
       m_listener(std::move(listener)),
-      m_event(std::move(event)) {
+      m_event(std::move(event)),
+      m_dnsResolver(std::move(dnsResolver)) {
     loadProfile();
     m_selector = std::make_unique<StrategySelector>(m_profile);
     if (!m_configPath.empty()) {
@@ -92,7 +94,8 @@ void SkyCore::start() {
     };
 
     if (!m_socks5Server.start(static_cast<uint16_t>(m_socksPort.load()),
-                              m_selector.get(), socks5Protector, socks5Event)) {
+                              m_selector.get(), socks5Protector, socks5Event,
+                              m_dnsResolver)) {
         m_running = false;
         SKY_LOGE("SkyCore: failed to start SOCKS5 server on port %d", m_socksPort.load());
         updateState(State::ERROR, "SOCKS5 server failed to start");

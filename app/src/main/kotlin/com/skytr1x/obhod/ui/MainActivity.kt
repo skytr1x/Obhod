@@ -8,6 +8,8 @@ import android.content.IntentFilter
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -26,6 +28,8 @@ import com.skytr1x.obhod.strategy.StrategyProfiles
 import com.skytr1x.obhod.vpn.ZapretVpnService
 import java.text.DateFormat
 import java.util.Date
+import android.net.Uri
+import android.content.ActivityNotFoundException
 import kotlinx.coroutines.launch
 
 class MainActivity : AppCompatActivity() {
@@ -35,6 +39,7 @@ class MainActivity : AppCompatActivity() {
     private var selectedStrategyIndex by mutableIntStateOf(0)
     private var updatingDomainList by mutableStateOf(false)
     private var domainListStatus by mutableStateOf("")
+    private var batteryOptimizationIgnored by mutableStateOf(false)
 
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -85,7 +90,9 @@ class MainActivity : AppCompatActivity() {
                     onTacticHelpAccepted = ::acceptTacticHelp,
                     updatingDomainList = updatingDomainList,
                     domainListStatus = domainListStatus,
-                    onUpdateDomainList = ::updateDomainList
+                    onUpdateDomainList = ::updateDomainList,
+                    batteryOptimizationIgnored = batteryOptimizationIgnored,
+                    onRequestBatteryOptimization = ::requestBatteryOptimizationExemption
                 )
             }
         }
@@ -110,7 +117,29 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        refreshBatteryOptimizationState()
         refreshState()
+    }
+
+    private fun refreshBatteryOptimizationState() {
+        val powerManager = getSystemService(PowerManager::class.java)
+        batteryOptimizationIgnored = Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+            powerManager.isIgnoringBatteryOptimizations(packageName)
+    }
+
+    private fun requestBatteryOptimizationExemption() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M || batteryOptimizationIgnored) return
+        val request = Intent(
+            Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+            Uri.parse("package:$packageName")
+        )
+        try {
+            startActivity(request)
+        } catch (_: ActivityNotFoundException) {
+            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+        } catch (_: SecurityException) {
+            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+        }
     }
 
     private fun selectStrategy(index: Int) {

@@ -9,8 +9,11 @@
     "tcp": [
       "multisplit-mobile",
       "split-sni",
+      "split-tlsrec",
+      "split-delay",
       "split-1",
       "fake-tls",
+      "fake-split",
       "tlsrec-sni",
       "disorder-1",
       "direct"
@@ -68,8 +71,27 @@
       }
     },
     {
-      "id": "split-1",
+      "id": "split-tlsrec",
       "cost": 3,
+      "tcp": {
+        "actions": [
+          { "type": "tlsrec", "pos": "sni" },
+          { "type": "split", "pos": "sni_end" }
+        ]
+      }
+    },
+    {
+      "id": "split-delay",
+      "cost": 4,
+      "tcp": {
+        "actions": [
+          { "type": "split", "pos": "sni", "delay_ms": 25 }
+        ]
+      }
+    },
+    {
+      "id": "split-1",
+      "cost": 5,
       "tcp": {
         "actions": [
           { "type": "split", "pos": "1" }
@@ -77,8 +99,23 @@
       }
     },
     {
+      "id": "fake-split",
+      "cost": 6,
+      "tcp": {
+        "actions": [
+          { "type": "split", "pos": "midsld" },
+          {
+            "type": "fake",
+            "pos": "sni_end",
+            "ttl_range": [2, 6],
+            "payload": "tls_google"
+          }
+        ]
+      }
+    },
+    {
       "id": "fake-tls",
-      "cost": 4,
+      "cost": 7,
       "tcp": {
         "actions": [
           {
@@ -92,7 +129,7 @@
     },
     {
       "id": "tlsrec-sni",
-      "cost": 5,
+      "cost": 8,
       "tcp": {
         "actions": [
           { "type": "tlsrec", "pos": "sni" }
@@ -101,7 +138,7 @@
     },
     {
       "id": "disorder-1",
-      "cost": 6,
+      "cost": 9,
       "tcp": {
         "actions": [
           { "type": "disorder", "pos": "1" }

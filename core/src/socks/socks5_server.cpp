@@ -10,13 +10,18 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdarg>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <iterator>
 #include <map>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -44,8 +49,8 @@ constexpr int kConnectTimeoutMs = 8000;
 constexpr int kFirstPayloadTimeoutMs = 30000;
 
 constexpr int kResponseTimeoutMs = 1500;
-constexpr int kMaxStrategyAttempts = 7;
-constexpr int kStrategyBudgetMs = 12000;
+constexpr int kMaxStrategyAttempts = 10;
+constexpr int kStrategyBudgetMs = 15000;
 constexpr int kRelayIdleTimeoutMs = 120000;
 constexpr int kRelayTunnelIdleTimeoutMs = 300000;
 constexpr std::size_t kMaxFirstPayload = 32768;
@@ -514,12 +519,14 @@ bool Socks5Server::shouldLogHost(const std::string& host) {
 }
 
 bool Socks5Server::start(uint16_t port, StrategySelector* selector,
-                         ProtectorCallback protector, EventCallback event) {
+                         ProtectorCallback protector, EventCallback event,
+                         DnsResolverCallback dnsResolver) {
     if (m_running.load()) return true;
 
     m_selector = selector;
     m_protector = std::move(protector);
     m_event = std::move(event);
+    m_dnsResolver = std::move(dnsResolver);
     {
         std::lock_guard<std::mutex> lock(m_eventMutex);
         m_lastEventLog.clear();
@@ -765,8 +772,8 @@ bool Socks5Server::sendReply(int clientFd, uint8_t rep, const struct sockaddr* b
 
 bool Socks5Server::connectRemote(const std::string& host, uint16_t port, int& outFd,
                                  struct sockaddr_storage* outAddr, socklen_t* outAddrLen,
-                                 std::string& error, std::size_t addressOffset,
-                                 int timeoutMs) {
+                                 std::string& error, int* connectRttMs,
+                                 std::size_t addressOffset, int timeoutMs) {
     std::vector<sockaddr_storage> addresses;
     std::vector<socklen_t> lengths;
     if (!resolve(host, port, SOCK_STREAM, addresses, lengths, error)) {
@@ -806,6 +813,7 @@ bool Socks5Server::connectRemote(const std::string& host, uint16_t port, int& ou
             continue;
         }
 
+        const auto connectStart = std::chrono::steady_clock::now();
         if (!connectWithTimeout(fd,
                                 reinterpret_cast<const sockaddr*>(&addresses[i]),
                                 lengths[i], perAddressTimeout, error, &m_running)) {
@@ -814,6 +822,11 @@ bool Socks5Server::connectRemote(const std::string& host, uint16_t port, int& ou
                      port, error.c_str());
             ::close(fd);
             continue;
+        }
+        if (connectRttMs) {
+            *connectRttMs = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - connectStart).count());
         }
 
         int nodelay = 1;
@@ -1004,17 +1017,23 @@ bool Socks5Server::waitForResponse(int fd, int timeoutMs, bool& readable,
 }
 
 void Socks5Server::handleConnect(int clientFd, const Request& request) {
+    if (request.port == 53 && m_dnsResolver) {
+        handleDnsConnect(clientFd, request);
+        return;
+    }
+
     const uint64_t requestId = g_nextTcpRequestId.fetch_add(1);
     [[maybe_unused]] TcpRequestLogScope requestLogScope(requestId);
     const std::string target = request.host + ':' + std::to_string(request.port);
     SKY_LOGI("SOCKS5: CONNECT %s", target.c_str());
 
     int remoteFd = -1;
+    int connectRttMs = 0;
     std::string error;
     sockaddr_storage remoteAddress{};
     socklen_t remoteAddressLen = 0;
     if (!connectRemote(request.host, request.port, remoteFd, &remoteAddress,
-                       &remoteAddressLen, error)) {
+                       &remoteAddressLen, error, &connectRttMs)) {
         if (m_running.load()) {
             emitEvent("[PROBLEM] type=tcp_connect_failed host=%s port=%u reason=%s",
                       request.host.c_str(), request.port,
@@ -1086,6 +1105,31 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
         candidates.push_back(std::move(direct));
     }
 
+    if (!DesyncEngine::supportsFakeZeroCopy()) {
+        const auto oldSize = candidates.size();
+        candidates.erase(
+            std::remove_if(candidates.begin(), candidates.end(),
+                           [](const StrategyChoice& choice) {
+                               if (!choice.strategy) return false;
+                               const TcpPlan& plan = choice.strategy->tcp;
+                               const bool hasFake = std::any_of(
+                                   plan.actions.begin(), plan.actions.end(),
+                                   [](const TcpAction& action) {
+                                       return action.type == ActionType::FAKE;
+                                   });
+                               const bool hasAlternative = std::any_of(
+                                   plan.actions.begin(), plan.actions.end(),
+                                   [](const TcpAction& action) {
+                                       return action.type != ActionType::FAKE;
+                                   });
+                               return hasFake && !hasAlternative;
+                           }),
+            candidates.end());
+        if (candidates.size() != oldSize && shouldLogHost("fake-unavailable")) {
+            emitEvent("[TCP-PLAN] fake-only strategies omitted: zero-copy is unavailable");
+        }
+    }
+
     const std::size_t generatedCandidateCount = candidates.size();
     const std::size_t profileCandidateLimit =
         static_cast<std::size_t>(kMaxStrategyAttempts);
@@ -1095,6 +1139,11 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
         std::set<const StrategyDef*> seenStrategies;
         StrategyChoice directChoice;
         bool hasDirect = false;
+        const bool hasTtlVariants = std::any_of(
+            candidates.begin(), candidates.end(),
+            [](const StrategyChoice& choice) { return choice.ttl > 0; });
+        const std::size_t uniqueStrategyLimit = profileCandidateLimit -
+            (hasTtlVariants ? 2 : 1);
         for (auto& choice : candidates) {
             if (choice.direct || (choice.strategy && choice.strategy->direct)) {
                 if (!hasDirect) {
@@ -1104,15 +1153,32 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
                 continue;
             }
             if (choice.strategy && seenStrategies.insert(choice.strategy).second &&
-                limited.size() + 1 < profileCandidateLimit) {
+                limited.size() < uniqueStrategyLimit) {
                 limited.push_back(choice);
             } else {
                 extraVariants.push_back(choice);
             }
         }
-        for (auto& choice : extraVariants) {
-            if (limited.size() + 1 >= profileCandidateLimit) break;
-            limited.push_back(std::move(choice));
+        if (hasTtlVariants && limited.size() + 1 < profileCandidateLimit) {
+            auto ttlVariant = std::find_if(
+                extraVariants.begin(), extraVariants.end(),
+                [&](const StrategyChoice& choice) {
+                    return choice.strategy && choice.ttl > 0 &&
+                           seenStrategies.count(choice.strategy) > 0;
+                });
+            if (ttlVariant != extraVariants.end()) {
+                const StrategyDef* variantStrategy = ttlVariant->strategy;
+                auto parent = std::find_if(
+                    limited.begin(), limited.end(),
+                    [variantStrategy](const StrategyChoice& choice) {
+                        return choice.strategy == variantStrategy;
+                    });
+                if (parent != limited.end()) {
+                    limited.insert(std::next(parent), std::move(*ttlVariant));
+                } else {
+                    limited.push_back(std::move(*ttlVariant));
+                }
+            }
         }
         if (hasDirect) {
             limited.push_back(std::move(directChoice));
@@ -1130,12 +1196,11 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
     const bool logThis = !directOnly && shouldLogHost(host);
 
     if (logThis) {
-        emitEvent("[TCP-PLAN] %s:%u remote_ip=%s generated=%zu candidates=%zu omitted_by_cap=%zu timeout_slots=%d response_timeout_ms=%d retry_budget_ms=%d cached=%s",
+        emitEvent("[TCP-PLAN] %s:%u remote_ip=%s generated=%zu candidates=%zu omitted_by_cap=%zu timeout_policy=rtt-derived(%d..4000ms) retry_budget_ms=%d cached=%s",
                   host.c_str(), request.port, connectedIp().c_str(),
                   generatedCandidateCount, candidates.size(),
                   generatedCandidateCount - candidates.size(),
-                  kStrategyBudgetMs / kResponseTimeoutMs, kResponseTimeoutMs,
-                  kStrategyBudgetMs,
+                  kResponseTimeoutMs, kStrategyBudgetMs,
                   cached.empty() ? "none" : cached.c_str());
     }
 
@@ -1158,7 +1223,195 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
     std::string lastFailure;
     const char* lastFailureStage = "none";
 
-    for (std::size_t i = 0; i < candidates.size(); ++i) {
+    std::size_t firstSequentialCandidate = 0;
+    const bool canRaceStrategies =
+        cached.empty() && completeClientHello && !directOnly &&
+        candidates.size() >= 2 && !candidates[0].direct &&
+        !candidates[1].direct && remainingBudget() >= 1000 &&
+        candidates[0].strategy &&
+        candidates[1].strategy;
+    if (canRaceStrategies) {
+        struct RaceAttempt {
+            bool done = false;
+            bool success = false;
+            bool responseVerified = false;
+            int fd = -1;
+            int connectRttMs = 0;
+            long elapsedMs = 0;
+            sockaddr_storage address{};
+            socklen_t addressLen = 0;
+            std::size_t tlsHeaderBytes = 0;
+            SendOutcome outcome;
+            std::string error;
+            const char* failureStage = "connect";
+        };
+        std::array<RaceAttempt, 2> raceAttempts;
+        std::array<int, 2> liveFds{-1, -1};
+        std::mutex raceMutex;
+        std::condition_variable raceCondition;
+        std::atomic<bool> raceCancelled{false};
+        int raceWinner = -1;
+        const auto raceStart = std::chrono::steady_clock::now();
+        const int raceBudgetMs = std::min(5000, remainingBudget());
+        const auto raceDeadline = raceStart + std::chrono::milliseconds(raceBudgetMs);
+        attemptsTried += 2;
+        const auto candidateRace = [&](std::size_t index) {
+            RaceAttempt& result = raceAttempts[index];
+            const StrategyChoice& choice = candidates[index];
+            const auto attemptStart = std::chrono::steady_clock::now();
+            int fd = -1;
+            std::string raceError;
+            if (!connectRemote(
+                    request.host, request.port, fd, &result.address,
+                    &result.addressLen, raceError, &result.connectRttMs, index,
+                    std::min(2500, raceBudgetMs))) {
+                result.error = raceError;
+                result.failureStage = "reconnect";
+            } else {
+                trackFd(fd);
+                result.fd = fd;
+                {
+                    std::lock_guard<std::mutex> lock(raceMutex);
+                    liveFds[index] = fd;
+                }
+                if (!raceCancelled.load() && m_running.load()) {
+                    const std::string strategyId = choice.key();
+                    emitEvent("[TRY] %s:%u via %s remote_ip=%s (parallel %zu/2)",
+                              host.c_str(), request.port, strategyId.c_str(),
+                              sockaddrText(reinterpret_cast<const sockaddr*>(
+                                  &result.address)).c_str(),
+                              index + 1);
+                    const bool sent = sendFirstPayload(
+                        fd, payload, host, choice, result.outcome);
+                    if (!sent) {
+                        result.error = result.outcome.error;
+                        result.failureStage = "strategy_send";
+                    } else {
+                        bool readable = false;
+                        const int responseTimeoutMs = std::clamp(
+                            result.connectRttMs * 3 + 250,
+                            kResponseTimeoutMs, 4000);
+                        const int remainingRaceMs = static_cast<int>(
+                            std::max<long long>(
+                                0, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       raceDeadline -
+                                       std::chrono::steady_clock::now()).count()));
+                        std::string responseError;
+                        if (remainingRaceMs > 0 &&
+                            waitForResponse(fd,
+                                            std::min(responseTimeoutMs,
+                                                     remainingRaceMs),
+                                            readable, result.tlsHeaderBytes,
+                                            responseError)) {
+                            std::lock_guard<std::mutex> lock(raceMutex);
+                            result.responseVerified = true;
+                            if (!raceCancelled.load()) {
+                                if (raceWinner < 0) {
+                                    result.success = true;
+                                    raceWinner = static_cast<int>(index);
+                                }
+                            }
+                        } else {
+                            result.error = responseError.empty()
+                                ? "response timeout"
+                                : responseError;
+                            result.failureStage = "tls_response";
+                        }
+                    }
+                }
+            }
+
+            result.elapsedMs = static_cast<long>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - attemptStart).count());
+            if (!result.success && fd >= 0) {
+                if (!result.responseVerified && !raceCancelled.load() &&
+                    std::strcmp(result.failureStage, "connect") != 0) {
+                    emitEvent("[FAIL] %s:%u via %s remote_ip=%s: %s (%ld ms)",
+                              host.c_str(), request.port, choice.key().c_str(),
+                              sockaddrText(reinterpret_cast<const sockaddr*>(
+                                  &result.address)).c_str(),
+                              result.error.c_str(), result.elapsedMs);
+                    if (m_selector) {
+                        m_selector->markFailure(host, choice.key(), strategyScope);
+                    }
+                }
+                closeTrackedFd(fd);
+            } else if (!raceCancelled.load() &&
+                       std::strcmp(result.failureStage, "connect") == 0) {
+                emitEvent("[FAIL] %s:%u via %s: reconnect failed: %s",
+                          host.c_str(), request.port, choice.key().c_str(),
+                          result.error.c_str());
+            }
+            {
+                std::lock_guard<std::mutex> lock(raceMutex);
+                result.done = true;
+                if (!result.success) liveFds[index] = -1;
+                raceCondition.notify_all();
+            }
+        };
+
+        closeTrackedFd(remoteFd);
+        remoteFd = -1;
+        std::array<std::thread, 2> raceThreads{
+            std::thread(candidateRace, 0),
+            std::thread(candidateRace, 1)
+        };
+        {
+            std::unique_lock<std::mutex> lock(raceMutex);
+            raceCondition.wait_until(lock, raceDeadline, [&]() {
+                return raceWinner >= 0 ||
+                       (raceAttempts[0].done && raceAttempts[1].done);
+            });
+            if (raceWinner >= 0) {
+                raceCancelled.store(true);
+                for (std::size_t index = 0; index < liveFds.size(); ++index) {
+                    if (static_cast<int>(index) != raceWinner && liveFds[index] >= 0) {
+                        ::shutdown(liveFds[index], SHUT_RDWR);
+                    }
+                }
+            }
+        }
+        raceCancelled.store(true);
+        for (auto& thread : raceThreads) {
+            if (thread.joinable()) thread.join();
+        }
+        firstSequentialCandidate = 2;
+        if (raceWinner >= 0) {
+            RaceAttempt& winner = raceAttempts[static_cast<std::size_t>(raceWinner)];
+            const StrategyChoice& choice = candidates[static_cast<std::size_t>(raceWinner)];
+            remoteFd = winner.fd;
+            remoteAddress = winner.address;
+            remoteAddressLen = winner.addressLen;
+            connectRttMs = winner.connectRttMs;
+            lastSendOk = true;
+            verified = true;
+            lastTlsHeaderBytes = winner.tlsHeaderBytes;
+            if (m_selector) {
+                m_selector->markSuccess(
+                    host, choice.key(), winner.elapsedMs, strategyScope);
+            }
+            const char* action = winner.outcome.usedFake ? "fake" :
+                winner.outcome.usedDisorder ? "disorder" :
+                winner.outcome.usedTlsRec ? "tlsrec" : "split";
+            emitEvent("[OK] %s:%u via %s remote_ip=%s (%ld ms, %s, TLS ServerHello observed; parallel race)",
+                      host.c_str(), request.port, choice.key().c_str(),
+                      connectedIp().c_str(), winner.elapsedMs, action);
+        } else {
+            lastSendOk = false;
+            for (const RaceAttempt& attempt : raceAttempts) {
+                if (!attempt.error.empty()) {
+                    lastFailure = attempt.error;
+                    lastFailureStage = attempt.failureStage;
+                    lastTlsHeaderBytes = std::max(
+                        lastTlsHeaderBytes, attempt.tlsHeaderBytes);
+                }
+            }
+        }
+    }
+
+    for (std::size_t i = firstSequentialCandidate;
+         !verified && i < candidates.size(); ++i) {
         const StrategyChoice& choice = candidates[i];
         const std::string strategyId = choice.key();
 
@@ -1172,9 +1425,13 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
         }
 
         const std::size_t candidatesRemaining = candidates.size() - i;
-        const int candidateBudgetMs = std::max(
-            1, budgetMs / static_cast<int>(candidatesRemaining));
-        const auto candidateDeadline = std::chrono::steady_clock::now() +
+        const int rttResponseTimeoutMs = std::clamp(
+            connectRttMs * 3 + 250, kResponseTimeoutMs, 4000);
+        const int candidateBudgetMs = std::min(
+            budgetMs,
+            std::max(rttResponseTimeoutMs + 250,
+                     budgetMs / static_cast<int>(candidatesRemaining)));
+        auto candidateDeadline = std::chrono::steady_clock::now() +
             std::chrono::milliseconds(candidateBudgetMs);
         const auto candidateRemainingMs = [&candidateDeadline]() {
             return static_cast<int>(std::max<long long>(
@@ -1192,7 +1449,8 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
                 break;
             }
             if (!connectRemote(request.host, request.port, remoteFd,
-                               &remoteAddress, &remoteAddressLen, error, i,
+                               &remoteAddress, &remoteAddressLen, error,
+                               &connectRttMs, i,
                                std::min(kConnectTimeoutMs, candidateRemainingMs()))) {
                 if (!m_running.load() || error == "stopped") {
                     cancelled = true;
@@ -1209,7 +1467,17 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
                 continue;
             }
             trackFd(remoteFd);
+            const int refreshedResponseTimeoutMs = std::clamp(
+                connectRttMs * 3 + 250, kResponseTimeoutMs, 4000);
+            const int remainingPlanMs = remainingBudget();
+            candidateDeadline = std::max(
+                candidateDeadline,
+                std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(std::min(
+                        remainingPlanMs, refreshedResponseTimeoutMs + 250)));
         }
+        const int responseTimeoutMs = std::clamp(
+            connectRttMs * 3 + 250, kResponseTimeoutMs, 4000);
 
         const auto attemptStart = std::chrono::steady_clock::now();
         ++attemptsTried;
@@ -1259,7 +1527,7 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
         bool readable = false;
         std::size_t tlsHeaderBytes = 0;
         std::string responseError;
-        if (waitForResponse(remoteFd, std::min(kResponseTimeoutMs,
+        if (waitForResponse(remoteFd, std::min(responseTimeoutMs,
                                                candidateRemainingMs()),
                             readable, tlsHeaderBytes, responseError)) {
             verified = true;
@@ -1342,7 +1610,8 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
         closeTrackedFd(remoteFd);
         remoteFd = -1;
         if (connectRemote(request.host, request.port, remoteFd,
-                          &remoteAddress, &remoteAddressLen, error, attemptsTried)) {
+                          &remoteAddress, &remoteAddressLen, error, nullptr,
+                          attemptsTried)) {
             trackFd(remoteFd);
             if (!sendAll(remoteFd, payload.data(), payload.size())) {
                 if (!m_running.load()) {
@@ -1395,6 +1664,57 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
     relay(clientFd, remoteFd, host, request.port, !completeClientHello,
           completeClientHello ? kRelayTunnelIdleTimeoutMs : kRelayIdleTimeoutMs);
     closeTrackedFd(remoteFd);
+}
+
+void Socks5Server::handleDnsConnect(int clientFd, const Request& request) {
+    if (!sendReply(clientFd, SOCKS5_REP_SUCCESS)) return;
+
+    while (m_running.load()) {
+        uint8_t lengthBytes[2];
+        if (!recvAll(clientFd, lengthBytes, sizeof(lengthBytes))) return;
+        const std::size_t queryLength =
+            static_cast<std::size_t>((lengthBytes[0] << 8) | lengthBytes[1]);
+        if (queryLength < 12 || queryLength > 4096) return;
+
+        std::vector<uint8_t> query(queryLength);
+        if (!recvAll(clientFd, query.data(), query.size())) return;
+
+        std::vector<uint8_t> response = m_dnsResolver(query);
+        if (response.size() >= 12 && response.size() <= 65535 &&
+            (response[2] & 0x80) != 0) {
+            const uint8_t responseLength[] = {
+                static_cast<uint8_t>(response.size() >> 8),
+                static_cast<uint8_t>(response.size() & 0xff)
+            };
+            if (!sendAll(clientFd, responseLength, sizeof(responseLength)) ||
+                !sendAll(clientFd, response.data(), response.size())) {
+                return;
+            }
+            continue;
+        }
+
+        int remoteFd = -1;
+        std::string error;
+        if (!connectRemote(request.host, request.port, remoteFd, nullptr, nullptr, error)) {
+            emitEvent("[DNS-DOH-FAIL] TCP fallback connection failed: %s", error.c_str());
+            return;
+        }
+        trackFd(remoteFd);
+        std::vector<uint8_t> framedQuery;
+        framedQuery.reserve(query.size() + sizeof(lengthBytes));
+        framedQuery.insert(framedQuery.end(), lengthBytes, lengthBytes + sizeof(lengthBytes));
+        framedQuery.insert(framedQuery.end(), query.begin(), query.end());
+        if (!sendAll(remoteFd, framedQuery.data(), framedQuery.size())) {
+            closeTrackedFd(remoteFd);
+            return;
+        }
+        if (shouldLogHost("dns-doh-fallback")) {
+            emitEvent("[PROBLEM] type=dns_doh_fallback host=dns");
+        }
+        relay(clientFd, remoteFd, request.host, request.port);
+        closeTrackedFd(remoteFd);
+        return;
+    }
 }
 
 bool Socks5Server::createRemoteUdp(const std::string& host, uint16_t port,
@@ -1481,6 +1801,99 @@ void Socks5Server::handleUdpAssociate(int clientFd, const Request& request) {
 
 void Socks5Server::relayUdp(int clientFd, int relayFd) {
     std::map<std::string, UdpPeer> peers;
+    struct DnsWork {
+        std::string host;
+        uint16_t port = 53;
+        std::vector<uint8_t> query;
+        std::vector<uint8_t> responseHeader;
+        sockaddr_storage clientAddr{};
+        socklen_t clientAddrLen = 0;
+    };
+    std::mutex dnsMutex;
+    std::condition_variable dnsCondition;
+    std::deque<DnsWork> dnsQueue;
+    bool stopDnsWorkers = false;
+    auto dnsWorker = [this, relayFd, &dnsMutex, &dnsCondition, &dnsQueue,
+                      &stopDnsWorkers]() {
+        while (true) {
+            DnsWork work;
+            {
+                std::unique_lock<std::mutex> lock(dnsMutex);
+                dnsCondition.wait(lock, [&]() {
+                    return stopDnsWorkers || !dnsQueue.empty();
+                });
+                if (stopDnsWorkers) return;
+                work = std::move(dnsQueue.front());
+                dnsQueue.pop_front();
+            }
+
+            std::vector<uint8_t> answer = m_dnsResolver(work.query);
+            if (answer.size() < 12 || answer.size() > 65535 ||
+                (answer[2] & 0x80) == 0 ||
+                answer.size() + work.responseHeader.size() > 65507) {
+                UdpPeer fallbackPeer;
+                std::string error;
+                if (shouldLogHost("dns-doh-fallback")) {
+                    emitEvent("[PROBLEM] type=dns_doh_fallback host=dns");
+                }
+                if (createRemoteUdp(work.host, work.port, fallbackPeer, error)) {
+                    const ssize_t sent = ::sendto(
+                        fallbackPeer.fd, work.query.data(), work.query.size(),
+                        MSG_NOSIGNAL,
+                        reinterpret_cast<const struct sockaddr*>(&fallbackPeer.addr),
+                        fallbackPeer.addrLen);
+                    struct pollfd responseFd{fallbackPeer.fd, POLLIN, 0};
+                    int pollResult = 0;
+                    if (sent == static_cast<ssize_t>(work.query.size())) {
+                        do {
+                            pollResult = ::poll(&responseFd, 1, 1200);
+                        } while (pollResult < 0 && errno == EINTR);
+                    }
+                    std::vector<uint8_t> fallbackResponse(65535);
+                    const ssize_t received = pollResult > 0
+                        ? ::recv(fallbackPeer.fd, fallbackResponse.data(),
+                                 fallbackResponse.size(), MSG_DONTWAIT)
+                        : -1;
+                    if (received >= 12) {
+                        fallbackResponse.resize(static_cast<std::size_t>(received));
+                        answer = std::move(fallbackResponse);
+                    }
+                    closeTrackedFd(fallbackPeer.fd);
+                } else if (shouldLogHost("dns-system-fallback-failed")) {
+                    emitEvent("[PROBLEM] type=dns_resolution_failed host=dns reason=resolver_unavailable detail=%s",
+                              error.c_str());
+                }
+            }
+
+            if (answer.size() < 12 || answer.size() > 65535 ||
+                (answer[2] & 0x80) == 0 ||
+                answer.size() + work.responseHeader.size() > 65507) {
+                if (shouldLogHost("dns-system-fallback-failed")) {
+                    emitEvent("[PROBLEM] type=dns_resolution_failed host=dns reason=all_resolvers_failed");
+                }
+                continue;
+            }
+            std::vector<uint8_t> response = std::move(work.responseHeader);
+            response.insert(response.end(), answer.begin(), answer.end());
+            const ssize_t relayed = ::sendto(
+                relayFd, response.data(), response.size(), MSG_NOSIGNAL,
+                reinterpret_cast<const struct sockaddr*>(&work.clientAddr),
+                work.clientAddrLen);
+            if (relayed == static_cast<ssize_t>(response.size())) {
+                m_bytesOut.fetch_add(static_cast<long>(answer.size()));
+                if (shouldLogHost("dns-doh")) {
+                    emitEvent("[DNS] UDP response returned");
+                }
+            } else if (shouldLogHost("dns-response-send-failed")) {
+                emitEvent("[DNS-FAIL] could not return DNS UDP response: %s",
+                          std::strerror(errno));
+            }
+        }
+    };
+    std::vector<std::thread> dnsThreads;
+    if (m_dnsResolver) {
+        dnsThreads.emplace_back(dnsWorker);
+    }
     sockaddr_storage clientAddr{};
     socklen_t clientAddrLen = 0;
     uint64_t totalSentPackets = 0;
@@ -1575,6 +1988,26 @@ void Socks5Server::relayUdp(int clientFd, int relayFd) {
                             const bool quicInitial = isQuicInitial(payload, payloadLen);
                             const bool stunBindingRequest =
                                 isStunBindingRequest(payload, payloadLen);
+
+                            if (port == 53 && m_dnsResolver && payloadLen >= 12 &&
+                                payloadLen <= 4096 && (payload[2] & 0x80) == 0) {
+                                std::lock_guard<std::mutex> lock(dnsMutex);
+                                if (dnsQueue.size() < 64) {
+                                    DnsWork work;
+                                    work.host = host;
+                                    work.port = port;
+                                    work.query.assign(payload, payload + payloadLen);
+                                    work.responseHeader = {0, 0, 0};
+                                    work.responseHeader.insert(
+                                        work.responseHeader.end(), data + 3,
+                                        data + offset);
+                                    work.clientAddr = clientAddr;
+                                    work.clientAddrLen = clientAddrLen;
+                                    dnsQueue.push_back(std::move(work));
+                                    dnsCondition.notify_one();
+                                    continue;
+                                }
+                            }
 
                             if (blockQuic && port == 443 && quicInitial) {
                                 if (shouldLogHost("quic:" + host)) {
@@ -1764,6 +2197,15 @@ void Socks5Server::relayUdp(int clientFd, int relayFd) {
 
     for (auto& entry : peers) {
         closeTrackedFd(entry.second.fd);
+    }
+    {
+        std::lock_guard<std::mutex> lock(dnsMutex);
+        stopDnsWorkers = true;
+        dnsQueue.clear();
+    }
+    dnsCondition.notify_all();
+    for (auto& thread : dnsThreads) {
+        if (thread.joinable()) thread.join();
     }
     emitEvent("[UDP-ASSOCIATE] stopped peers=%zu tx_packets=%llu tx_bytes=%llu rx_packets=%llu rx_bytes=%llu",
               peers.size(), static_cast<unsigned long long>(totalSentPackets),

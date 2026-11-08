@@ -24,12 +24,14 @@ public:
     static constexpr int MAX_CONNECTIONS = 64;
     using ProtectorCallback = std::function<bool(int fd)>;
     using EventCallback = std::function<void(const std::string& message)>;
+    using DnsResolverCallback =
+        std::function<std::vector<std::uint8_t>(const std::vector<std::uint8_t>&)>;
 
     Socks5Server();
     ~Socks5Server();
 
     bool start(uint16_t port, StrategySelector* selector, ProtectorCallback protector,
-               EventCallback event = nullptr);
+               EventCallback event = nullptr, DnsResolverCallback dnsResolver = nullptr);
     void stop();
 
     bool isRunning() const { return m_running.load(); }
@@ -70,6 +72,7 @@ private:
     void acceptLoop();
     void handleClient(int clientFd);
     void handleConnect(int clientFd, const Request& request);
+    void handleDnsConnect(int clientFd, const Request& request);
     void handleUdpAssociate(int clientFd, const Request& request);
 
     bool receiveRequest(int clientFd, Request& request, uint8_t& replyCode);
@@ -82,8 +85,8 @@ private:
 
     bool connectRemote(const std::string& host, uint16_t port, int& outFd,
                        struct sockaddr_storage* outAddr, socklen_t* outAddrLen,
-                       std::string& error, std::size_t addressOffset = 0,
-                       int timeoutMs = 8000);
+                       std::string& error, int* connectRttMs = nullptr,
+                       std::size_t addressOffset = 0, int timeoutMs = 8000);
     int waitForInitialData(int clientFd, int remoteFd, int timeoutMs);
     bool readInitialPayload(int clientFd, std::vector<uint8_t>& payload,
                             std::string& host, bool captureOpaqueHeader);
@@ -104,6 +107,7 @@ private:
     StrategySelector* m_selector = nullptr;
     ProtectorCallback m_protector;
     EventCallback m_event;
+    DnsResolverCallback m_dnsResolver;
     std::mutex m_eventMutex;
     std::map<std::string, std::chrono::steady_clock::time_point> m_lastEventLog;
 

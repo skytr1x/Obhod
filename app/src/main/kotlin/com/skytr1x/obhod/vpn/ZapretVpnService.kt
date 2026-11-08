@@ -13,6 +13,7 @@ import android.telephony.TelephonyManager
 import org.json.JSONObject
 import com.skytr1x.obhod.bridge.NativeBridge
 import com.skytr1x.obhod.logging.AppLog
+import com.skytr1x.obhod.network.DnsOverHttpsResolver
 import com.skytr1x.obhod.network.NetworkCalibrator
 import com.skytr1x.obhod.notification.ObhodNotifications
 import com.skytr1x.obhod.proxy.TelegramProxyService
@@ -143,6 +144,7 @@ class ZapretVpnService : VpnService(), NativeBridge.Protector, NativeBridge.List
                 "Калибровка сети: ${calibration.signal.storageValue}" +
                     if (calibration.fromCache) " (кэш)" else ""
             )
+            AppLog.i(TAG, "DNS Discord/system-vs-DoH: ${calibration.dnsComparison.storageValue}")
             AppLog.i(
                 TAG,
                 if (tcpOrder.isBlank()) {
@@ -251,6 +253,11 @@ misc:
 
     override fun protect(fd: Int): Boolean = super.protect(fd)
 
+    override fun resolveDns(query: ByteArray): ByteArray? =
+        DnsOverHttpsResolver.resolve(query, underlyingNetwork()) { socket ->
+            protect(socket)
+        }
+
     override fun onState(state: Int, message: String) {
         AppLog.i(TAG, "Состояние ядра $state: $message")
         if (state == 4) publishState(false, currentProfile())
@@ -279,6 +286,10 @@ misc:
         }
         val reason = fields["reason"].orEmpty()
         val warning = when (type) {
+            "dns_doh_fallback" ->
+                "DNS: DoH-провайдеры недоступны, запрос передан системному DNS."
+            "dns_resolution_failed" ->
+                "DNS: не удалось получить ответ ни через DoH, ни через системный DNS."
             "tcp_connect_failed" -> {
                 val why = when (reason) {
                     "timeout" -> "истёк таймаут TCP-подключения"
@@ -509,6 +520,7 @@ misc:
             "Смена сетевого профиля: ${calibration.signal.storageValue}" +
                 if (calibration.fromCache) " (кэш)" else ""
         )
+        AppLog.i(TAG, "DNS Discord/system-vs-DoH: ${calibration.dnsComparison.storageValue}")
         AppLog.i(
             TAG,
             if (tcpOrder.isBlank()) {
