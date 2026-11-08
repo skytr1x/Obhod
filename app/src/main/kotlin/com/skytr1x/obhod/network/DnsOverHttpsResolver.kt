@@ -253,6 +253,38 @@ internal object DnsOverHttpsResolver {
         protectSocket: (Socket) -> Boolean,
         remainingMs: Int
     ): ByteArray? {
+        val deadline = System.nanoTime() +
+            TimeUnit.MILLISECONDS.toNanos(remainingMs.toLong())
+        for (sendSni in listOf(false, true)) {
+            val timeoutMs = remainingTimeoutMs(deadline)
+            if (timeoutMs <= 0) return null
+            val response = try {
+                queryProviderWithSni(
+                    host,
+                    ip,
+                    query,
+                    network,
+                    protectSocket,
+                    timeoutMs,
+                    sendSni
+                )
+            } catch (_: IOException) {
+                null
+            }
+            if (response != null) return response
+        }
+        return null
+    }
+
+    private fun queryProviderWithSni(
+        host: String,
+        ip: String,
+        query: ByteArray,
+        network: Network?,
+        protectSocket: (Socket) -> Boolean,
+        remainingMs: Int,
+        sendSni: Boolean
+    ): ByteArray? {
         val networkHandle = network?.networkHandle ?: 0L
         val key = ConnectionKey(networkHandle, host)
         val connections = checkNotNull(threadConnections.get())
@@ -293,7 +325,8 @@ internal object DnsOverHttpsResolver {
             ip,
             network,
             protectSocket,
-            connectTimeoutMs
+            connectTimeoutMs,
+            sendSni
         )
         try {
             val response = exchange(connection, query, deadline)
@@ -315,7 +348,8 @@ internal object DnsOverHttpsResolver {
         ip: String,
         network: Network?,
         protectSocket: (Socket) -> Boolean,
-        remainingMs: Int
+        remainingMs: Int,
+        sendSni: Boolean
     ): DnsHttpsConnection {
         val rawSocket = Socket()
         try {
@@ -332,7 +366,11 @@ internal object DnsOverHttpsResolver {
                 .createSocket(rawSocket, host, 443, true) as SSLSocket
             val parameters = ssl.sslParameters
             parameters.endpointIdentificationAlgorithm = "HTTPS"
-            parameters.serverNames = listOf(SNIHostName(host))
+            parameters.serverNames = if (sendSni) {
+                listOf(SNIHostName(host))
+            } else {
+                emptyList()
+            }
             ssl.sslParameters = parameters
             ssl.soTimeout = minOf(READ_TIMEOUT_MS, remainingMs)
             ssl.startHandshake()

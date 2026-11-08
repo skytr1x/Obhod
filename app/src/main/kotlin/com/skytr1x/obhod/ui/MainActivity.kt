@@ -26,6 +26,8 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.skytr1x.obhod.diagnostics.DiagnosticReport
 import com.skytr1x.obhod.diagnostics.DiagnosticReportData
+import com.skytr1x.obhod.diagnostics.ConnectivitySelfTest
+import com.skytr1x.obhod.diagnostics.TransferTestConfig
 import com.skytr1x.obhod.logging.AppLog
 import com.skytr1x.obhod.network.NetworkCalibrator
 import com.skytr1x.obhod.proxy.TelegramProxyService
@@ -52,6 +54,8 @@ class MainActivity : AppCompatActivity() {
     private var domainListStatus by mutableStateOf("")
     private var batteryOptimizationIgnored by mutableStateOf(false)
     private var pendingDiagnosticReport: String? = null
+    private var transferTestRunning by mutableStateOf(false)
+    private var transferTestStatus by mutableStateOf("")
 
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -72,7 +76,7 @@ class MainActivity : AppCompatActivity() {
             if (uri == null) {
                 pendingDiagnosticReport = null
             } else {
-                val report = pendingDiagnosticReport ?: createDiagnosticReport()
+                val report = pendingDiagnosticReport ?: createDiagnosticReport("")
                 pendingDiagnosticReport = null
                 lifecycleScope.launch {
                     try {
@@ -144,7 +148,10 @@ class MainActivity : AppCompatActivity() {
                     onUpdateDomainList = ::updateDomainList,
                     batteryOptimizationIgnored = batteryOptimizationIgnored,
                     onRequestBatteryOptimization = ::requestBatteryOptimizationExemption,
-                    onExportDiagnosticReport = ::requestDiagnosticReport
+                    onExportDiagnosticReport = ::requestDiagnosticReport,
+                    transferTestRunning = transferTestRunning,
+                    transferTestStatus = transferTestStatus,
+                    onRunTransferTest = ::runTransferTest
                 )
             }
         }
@@ -248,13 +255,51 @@ class MainActivity : AppCompatActivity() {
         DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
             .format(Date(timestamp))
 
-    private fun requestDiagnosticReport() {
+    private fun requestDiagnosticReport(operatorRegion: String) {
         val timestamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(Date())
-        pendingDiagnosticReport = createDiagnosticReport()
+        pendingDiagnosticReport = createDiagnosticReport(operatorRegion)
         diagnosticReportLauncher.launch("obhod-diagnostics-$timestamp.txt")
     }
 
-    private fun createDiagnosticReport(): String {
+    private fun runTransferTest(config: TransferTestConfig) {
+        if (transferTestRunning) return
+        if (!vpnRunning) {
+            Toast.makeText(this, "Сначала включите VPN", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        transferTestRunning = true
+        transferTestStatus = "Тест передачи выполняется…"
+        AppLog.i(
+            "SelfTest",
+            "[SELFTEST_RUN] payload_kib=${config.payloadKiB} " +
+                "host_timeout_s=${config.hostTimeoutSeconds} " +
+                "idle_timeout_s=${config.idleTimeoutSeconds}"
+        )
+        lifecycleScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    ConnectivitySelfTest.run(
+                        config = config,
+                        onProgress = { service ->
+                            AppLog.i("SelfTest", "[SELFTEST_PROGRESS] service=$service")
+                        },
+                        onResult = { result ->
+                            AppLog.i("SelfTest", result.asLogMessage())
+                        }
+                    )
+                }
+                transferTestStatus = "Тест завершён; результаты добавлены в логи."
+            } catch (error: IOException) {
+                AppLog.e("SelfTest", "Тест передачи завершился с ошибкой", error)
+                transferTestStatus = "Тест завершился с ошибкой; подробности в логах."
+            } finally {
+                transferTestRunning = false
+            }
+        }
+    }
+
+    private fun createDiagnosticReport(operatorRegion: String): String {
         val connectivity = getSystemService(ConnectivityManager::class.java)
         val network = connectivity?.let(::underlyingNetworkForReport)
         val capabilities = network?.let(connectivity::getNetworkCapabilities)
@@ -310,8 +355,10 @@ class MainActivity : AppCompatActivity() {
             calibrationSignal = calibrationSignal,
             dnsComparison = dnsComparison,
             selectedProfile = selectedProfile,
+            operatorRegion = operatorRegion,
             latestTlsSuccess = DiagnosticReport.latestTlsSuccess(currentNetworkMessages),
             tlsSamples = DiagnosticReport.tlsSampleSummary(currentNetworkMessages),
+            selfTest = DiagnosticReport.latestSelfTest(currentNetworkMessages),
             latestFailure = DiagnosticReport.latestFailure(currentNetworkMessages),
             quicSuppressionCount = DiagnosticReport.quicSuppressionCount(currentNetworkMessages)
         )

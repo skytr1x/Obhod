@@ -90,6 +90,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withLink
 import androidx.compose.ui.unit.dp
 import com.skytr1x.obhod.logging.AppLog
+import com.skytr1x.obhod.diagnostics.TransferTestConfig
 import com.skytr1x.obhod.R
 import com.skytr1x.obhod.proxy.TelegramProxyConfig
 import com.skytr1x.obhod.strategy.StrategyProfileOption
@@ -104,7 +105,7 @@ private enum class ObhodTab(val label: String, val icon: Int) {
 }
 
 @Composable
-fun ObhodApp(
+internal fun ObhodApp(
     vpnRunning: Boolean,
     telegramRunning: Boolean,
     starting: Boolean,
@@ -118,7 +119,10 @@ fun ObhodApp(
     onUpdateDomainList: () -> Unit,
     batteryOptimizationIgnored: Boolean,
     onRequestBatteryOptimization: () -> Unit,
-    onExportDiagnosticReport: () -> Unit
+    onExportDiagnosticReport: (String) -> Unit,
+    transferTestRunning: Boolean,
+    transferTestStatus: String,
+    onRunTransferTest: (TransferTestConfig) -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -176,7 +180,11 @@ fun ObhodApp(
 
                     ObhodTab.Logs -> LogsScreen(
                         onCopyText = copyText,
-                        onExportDiagnosticReport = onExportDiagnosticReport
+                        onExportDiagnosticReport = onExportDiagnosticReport,
+                        vpnRunning = vpnRunning,
+                        transferTestRunning = transferTestRunning,
+                        transferTestStatus = transferTestStatus,
+                        onRunTransferTest = onRunTransferTest
                     )
                     ObhodTab.Source -> SourceScreen()
                 }
@@ -706,11 +714,19 @@ private fun StrategySelector(
 @Composable
 private fun LogsScreen(
     onCopyText: (String) -> Unit,
-    onExportDiagnosticReport: () -> Unit
+    onExportDiagnosticReport: (String) -> Unit,
+    vpnRunning: Boolean,
+    transferTestRunning: Boolean,
+    transferTestStatus: String,
+    onRunTransferTest: (TransferTestConfig) -> Unit
 ) {
     val entries by AppLog.entries.collectAsState()
     val newestFirst = entries.asReversed()
     var confirmDiagnosticExport by rememberSaveable { mutableStateOf(false) }
+    var operatorRegion by remember { mutableStateOf("") }
+    var configureTransferTest by rememberSaveable { mutableStateOf(false) }
+    var payloadKiB by remember { mutableIntStateOf(150) }
+    var idleTimeoutSeconds by remember { mutableIntStateOf(4) }
     Column(
         Modifier
             .fillMaxSize()
@@ -763,6 +779,29 @@ private fun LogsScreen(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 4.dp)
         )
+        Spacer(Modifier.height(12.dp))
+        OutlinedButton(
+            onClick = { configureTransferTest = true },
+            enabled = vpnRunning && !transferTestRunning,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            if (transferTestRunning) {
+                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(10.dp))
+            }
+            Text(if (transferTestRunning) "Тест передачи выполняется…" else "Проверить HTTPS-передачу")
+        }
+        Text(
+            text = when {
+                transferTestRunning -> transferTestStatus
+                !vpnRunning -> "Для проверки выбранных стратегий сначала включите VPN."
+                transferTestStatus.isNotBlank() -> transferTestStatus
+                else -> "Тест отправит до 200 KiB на каждый из четырёх выбранных сервисов."
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 4.dp)
+        )
         Spacer(Modifier.height(20.dp))
         if (entries.isEmpty()) {
             EmptyLogs()
@@ -781,32 +820,149 @@ private fun LogsScreen(
         }
         if (confirmDiagnosticExport) {
             AlertDialog(
-                onDismissRequest = { confirmDiagnosticExport = false },
+                onDismissRequest = {
+                    confirmDiagnosticExport = false
+                    operatorRegion = ""
+                },
                 title = { Text("Сохранить отчёт?") },
                 text = {
-                    Text(
-                        "В отчёт войдут версия приложения и устройства, тип сети, результаты " +
-                            "калибровки и последние обезличенные метрики. Домены, IP-адреса, SSID " +
-                            "и содержимое трафика не включаются. Ничего не отправляется; выберите " +
-                            "место, куда сохранить файл."
-                    )
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text(
+                            "В отчёт войдут версия приложения и устройства, тип сети, результаты " +
+                                "калибровки и последние метрики. Домены, IP-адреса, SSID и содержимое " +
+                                "трафика не включаются. Ничего не отправляется; выберите место, куда " +
+                                "сохранить файл. Оператора и регион можно указать вручную."
+                        )
+                        OutlinedTextField(
+                            value = operatorRegion,
+                            onValueChange = { value ->
+                                operatorRegion = value.filterNot(Char::isISOControl).take(80)
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            label = { Text("Оператор / регион (необязательно)") },
+                            supportingText = { Text("Заполняется вручную; геолокация не используется.") },
+                            singleLine = true
+                        )
+                    }
                 },
                 confirmButton = {
                     TextButton(
                         onClick = {
                             confirmDiagnosticExport = false
-                            onExportDiagnosticReport()
+                            onExportDiagnosticReport(operatorRegion.trim())
+                            operatorRegion = ""
                         }
                     ) {
                         Text("Выбрать место")
                     }
                 },
                 dismissButton = {
-                    TextButton(onClick = { confirmDiagnosticExport = false }) {
+                    TextButton(
+                        onClick = {
+                            confirmDiagnosticExport = false
+                            operatorRegion = ""
+                        }
+                    ) {
                         Text("Отмена")
                     }
                 }
             )
+        }
+        if (configureTransferTest) {
+            AlertDialog(
+                onDismissRequest = { configureTransferTest = false },
+                title = { Text("Проверка передачи данных") },
+                text = {
+                    Column(
+                        modifier = Modifier.verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text(
+                            "Тест по очереди установит TLS-соединение и запросит до выбранного " +
+                                "объёма данных у YouTube, Discord, 4pda и Cloudflare. Запросы " +
+                                "выполняются только после нажатия «Начать тест» и не содержат " +
+                                "учётных данных. Результаты останутся в локальных логах."
+                        )
+                        TransferTestOption(
+                            label = "Лимит данных на сервис",
+                            value = payloadKiB,
+                            suffix = "KiB",
+                            options = TransferTestConfig.PAYLOAD_OPTIONS_KIB,
+                            onSelected = { payloadKiB = it }
+                        )
+                        Text("Максимум 15 секунд на сервис.")
+                        TransferTestOption(
+                            label = "Таймаут без новых данных",
+                            value = idleTimeoutSeconds,
+                            suffix = "с",
+                            options = TransferTestConfig.IDLE_TIMEOUT_OPTIONS_SECONDS,
+                            onSelected = { idleTimeoutSeconds = it }
+                        )
+                    }
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            configureTransferTest = false
+                            onRunTransferTest(
+                                TransferTestConfig(
+                                    payloadKiB = payloadKiB,
+                                    idleTimeoutSeconds = idleTimeoutSeconds
+                                )
+                            )
+                        }
+                    ) {
+                        Text("Начать тест")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { configureTransferTest = false }) {
+                        Text("Отмена")
+                    }
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun TransferTestOption(
+    label: String,
+    value: Int,
+    suffix: String,
+    options: List<Int>,
+    onSelected: (Int) -> Unit
+) {
+    var expanded by remember { mutableStateOf(false) }
+    ExposedDropdownMenuBox(
+        expanded = expanded,
+        onExpandedChange = { expanded = !expanded }
+    ) {
+        OutlinedTextField(
+            value = "$value $suffix",
+            onValueChange = {},
+            readOnly = true,
+            label = { Text(label) },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
+            modifier = Modifier
+                .fillMaxWidth()
+                .menuAnchor(
+                    androidx.compose.material3.ExposedDropdownMenuAnchorType.PrimaryNotEditable
+                )
+        )
+        ExposedDropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false }
+        ) {
+            options.forEach { option ->
+                DropdownMenuItem(
+                    text = { Text("$option $suffix") },
+                    onClick = {
+                        onSelected(option)
+                        expanded = false
+                    }
+                )
+            }
         }
     }
 }
