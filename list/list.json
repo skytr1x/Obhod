@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "include": [
+    "youtube.com",
+    "googlevideo.com",
+    "ytimg.com",
+    "youtubei.googleapis.com",
+    "googleusercontent.com",
+    "ggpht.com",
+    "4pda.to",
+    "discord.com",
+    "discord.gg",
+    "discord.media",
+    "discordapp.com",
+    "discordapp.net",
+    "discordcdn.com",
+    "cdn.discordapp.com",
+    "media.discordapp.net",
+    "images-ext-1.discordapp.net",
+    "images-ext-2.discordapp.net",
+    "twitch.tv",
+    "ttvnw.net",
+    "jtvnw.net",
+    "instagram.com",
+    "facebook.com",
+    "fbcdn.net",
+    "messenger.com",
+    "twitter.com",
+    "x.com",
+    "t.co",
+    "twimg.com"
+  ]
+}
