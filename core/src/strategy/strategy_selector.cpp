@@ -55,6 +55,12 @@ std::string sanitizeCacheName(const std::string& key) {
     return out.empty() ? "default" : out;
 }
 
+std::string stateKeyFor(const std::string& host, const std::string& scope) {
+    const std::string normalized = normalizeHost(host);
+    if (scope.empty()) return normalized;
+    return normalized + "|" + scope;
+}
+
 std::vector<int> ttlValuesFor(const StrategyDef* strategy, bool udp) {
     int minTtl = 0;
     int maxTtl = 0;
@@ -87,9 +93,17 @@ std::vector<int> ttlValuesFor(const StrategyDef* strategy, bool udp) {
 StrategySelector::StrategySelector(std::shared_ptr<Profile> profile)
     : m_profile(profile ? std::move(profile) : defaultProfile()) {}
 
-std::shared_ptr<const Profile> StrategySelector::profile() const {
+StrategyChoice StrategySelector::findStrategy(const std::string& id) const {
     std::lock_guard<std::mutex> lock(m_mutex);
-    return m_profile;
+    StrategyChoice choice;
+    choice.owner = m_profile;
+    choice.strategy = m_profile ? m_profile->findStrategy(id) : nullptr;
+    return choice;
+}
+
+bool StrategySelector::quicFallbackEnabled() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_profile && m_profile->quicFallback;
 }
 
 std::string StrategySelector::cacheFileLocked() const {
@@ -101,6 +115,8 @@ void StrategySelector::setCachePath(const std::string& basePath) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_cacheBasePath = basePath;
     m_cache.clear();
+    m_networkPreferredTcp.clear();
+    m_networkPreferredUdp.clear();
     loadCacheLocked();
 }
 
@@ -110,9 +126,35 @@ std::size_t StrategySelector::setNetworkKey(const std::string& networkKey) {
     if (key != m_networkKey) {
         m_networkKey = key;
         m_cache.clear();
+        m_networkTcpOrder.clear();
+        m_networkPreferredTcp.clear();
+        m_networkPreferredUdp.clear();
     }
     loadCacheLocked();
     return m_cache.size();
+}
+
+void StrategySelector::setNetworkStrategyOrder(const std::string& tcpOrder) {
+    std::vector<std::string> order;
+    std::size_t begin = 0;
+    while (begin < tcpOrder.size()) {
+        const std::size_t end = tcpOrder.find(',', begin);
+        std::string id = tcpOrder.substr(
+            begin, end == std::string::npos ? std::string::npos : end - begin);
+        const std::size_t first = id.find_first_not_of(" \t\r\n");
+        if (first != std::string::npos) {
+            const std::size_t last = id.find_last_not_of(" \t\r\n");
+            id = id.substr(first, last - first + 1);
+            if (std::find(order.begin(), order.end(), id) == order.end()) {
+                order.push_back(std::move(id));
+            }
+        }
+        if (end == std::string::npos) break;
+        begin = end + 1;
+    }
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_networkTcpOrder = std::move(order);
 }
 
 void StrategySelector::loadCacheLocked() {
@@ -136,6 +178,16 @@ void StrategySelector::loadCacheLocked() {
     std::string line;
     std::size_t loaded = 0;
     while (std::getline(input, line)) {
+        constexpr const char kTcpPreferred[] = "# network-tcp-preferred ";
+        constexpr const char kUdpPreferred[] = "# network-udp-preferred ";
+        if (line.compare(0, sizeof(kTcpPreferred) - 1, kTcpPreferred) == 0) {
+            m_networkPreferredTcp = line.substr(sizeof(kTcpPreferred) - 1);
+            continue;
+        }
+        if (line.compare(0, sizeof(kUdpPreferred) - 1, kUdpPreferred) == 0) {
+            m_networkPreferredUdp = line.substr(sizeof(kUdpPreferred) - 1);
+            continue;
+        }
         if (line.empty() || line[0] == '#') continue;
         const std::size_t tab = line.find('\t');
         if (tab == std::string::npos || tab == 0) continue;
@@ -167,6 +219,12 @@ void StrategySelector::saveCacheLocked() {
         if (!output) return;
         output << "# skyunblock strategy cache v1\n";
         output << "# network " << m_networkKey << "\n";
+        if (!m_networkPreferredTcp.empty()) {
+            output << "# network-tcp-preferred " << m_networkPreferredTcp << "\n";
+        }
+        if (!m_networkPreferredUdp.empty()) {
+            output << "# network-udp-preferred " << m_networkPreferredUdp << "\n";
+        }
         std::size_t written = 0;
         for (const auto& entry : m_cache) {
             if (entry.second.preferred.empty()) continue;
@@ -198,7 +256,8 @@ bool StrategySelector::isUsable(const StrategyDef* strategy, bool udp) {
     return strategy->tcp.valid || !strategy->tcp.actions.empty();
 }
 
-StrategyChoice StrategySelector::routeLocked(const std::string& rawHost, bool udp) const {
+StrategyChoice StrategySelector::routeLocked(const std::string& rawHost, bool udp,
+                                             const std::string& scope) const {
     StrategyChoice choice;
     choice.owner = m_profile;
     if (!m_profile) return choice;
@@ -243,14 +302,15 @@ StrategyChoice StrategySelector::routeLocked(const std::string& rawHost, bool ud
         }
     }
 
-    const std::vector<StrategyChoice> list = candidatesLocked(host, udp);
+    const std::vector<StrategyChoice> list = candidatesLocked(host, udp, scope);
     if (!list.empty()) return list.front();
     choice.direct = true;
     return choice;
 }
 
 std::vector<StrategyChoice> StrategySelector::candidatesLocked(const std::string& rawHost,
-                                                               bool udp) const {
+                                                               bool udp,
+                                                               const std::string& scope) const {
     std::vector<StrategyChoice> out;
     if (!m_profile) return out;
 
@@ -296,7 +356,9 @@ std::vector<StrategyChoice> StrategySelector::candidatesLocked(const std::string
 
     auto addById = [&](const std::string& id) {
         const StrategyDef* strategy = m_profile->findStrategy(id);
-        if (!strategy || !isUsable(strategy, udp) || seen.count(strategy)) return;
+        if (!strategy || !isUsable(strategy, udp) || seen.count(strategy)) {
+            return;
+        }
         seen.insert(strategy);
         ordered.push_back(strategy);
     };
@@ -305,12 +367,25 @@ std::vector<StrategyChoice> StrategySelector::candidatesLocked(const std::string
         seen.insert(ruleStrategy);
         ordered.push_back(ruleStrategy);
     }
+
+    const std::string& networkPreferred = udp
+        ? m_networkPreferredUdp
+        : m_networkPreferredTcp;
+    if (!networkPreferred.empty()) {
+        const std::size_t ttlSeparator = networkPreferred.find('@');
+        addById(networkPreferred.substr(0, ttlSeparator));
+    }
+    if (!udp) {
+        for (const auto& id : m_networkTcpOrder) addById(id);
+    }
     for (const auto& id : defaults) addById(id);
 
     std::vector<const StrategyDef*> byCost;
     for (const auto& strategy : m_profile->strategies) {
         if (strategy.id == "mtproto-obfs-split") continue;
-        if (isUsable(&strategy, udp)) byCost.push_back(&strategy);
+        if (isUsable(&strategy, udp)) {
+            byCost.push_back(&strategy);
+        }
     }
     std::stable_sort(byCost.begin(), byCost.end(),
                      [](const StrategyDef* a, const StrategyDef* b) {
@@ -323,15 +398,14 @@ std::vector<StrategyChoice> StrategySelector::candidatesLocked(const std::string
     }
 
     const HostState* state = nullptr;
-    auto it = m_cache.find(host);
+    auto it = m_cache.find(stateKeyFor(host, scope));
     if (it != m_cache.end()) {
         if (std::chrono::steady_clock::now() - it->second.updated < kCacheTtl) {
             state = &it->second;
         }
     }
 
-    std::vector<StrategyChoice> base;
-    std::vector<StrategyChoice> extra;
+    std::vector<StrategyChoice> expanded;
     StrategyChoice directChoice;
     bool hasDirect = false;
 
@@ -347,23 +421,33 @@ std::vector<StrategyChoice> StrategySelector::candidatesLocked(const std::string
         }
 
         const std::vector<int> ttls = ttlValuesFor(strategy, udp);
-        for (std::size_t i = 0; i < ttls.size(); ++i) {
+        for (int ttl : ttls) {
             StrategyChoice choice;
             choice.owner = m_profile;
             choice.strategy = strategy;
-            choice.ttl = ttls[i];
-            if (i == 0) {
-                base.push_back(std::move(choice));
-            } else {
-                extra.push_back(std::move(choice));
-            }
+            choice.ttl = ttl;
+            expanded.push_back(std::move(choice));
         }
     }
 
-    std::vector<StrategyChoice> expanded;
-    expanded.reserve(base.size() + extra.size());
-    for (auto& choice : base) expanded.push_back(std::move(choice));
-    for (auto& choice : extra) expanded.push_back(std::move(choice));
+    if (!networkPreferred.empty()) {
+        auto found = std::find_if(expanded.begin(), expanded.end(),
+                                  [&](const StrategyChoice& choice) {
+                                      return choice.key() == networkPreferred;
+                                  });
+        if (found == expanded.end()) {
+            const std::size_t ttlSeparator = networkPreferred.find('@');
+            const std::string preferredId = networkPreferred.substr(0, ttlSeparator);
+            found = std::find_if(expanded.begin(), expanded.end(),
+                                 [&](const StrategyChoice& choice) {
+                                     return choice.strategy &&
+                                            choice.strategy->id == preferredId;
+                                 });
+        }
+        if (found != expanded.end()) {
+            std::rotate(expanded.begin(), found, found + 1);
+        }
+    }
 
     if (state && !state->preferred.empty()) {
         auto found = std::find_if(expanded.begin(), expanded.end(),
@@ -424,24 +508,27 @@ std::vector<StrategyChoice> StrategySelector::candidatesLocked(const std::string
     return out;
 }
 
-StrategyChoice StrategySelector::select(const std::string& host, bool udp) const {
+StrategyChoice StrategySelector::select(const std::string& host, bool udp,
+                                        const std::string& scope) const {
     std::lock_guard<std::mutex> lock(m_mutex);
-    return routeLocked(host, udp);
+    return routeLocked(host, udp, scope);
 }
 
 std::vector<StrategyChoice> StrategySelector::candidates(const std::string& host,
-                                                         bool udp) const {
+                                                         bool udp,
+                                                         const std::string& scope) const {
     std::lock_guard<std::mutex> lock(m_mutex);
-    return candidatesLocked(host, udp);
+    return candidatesLocked(host, udp, scope);
 }
 
 void StrategySelector::markSuccess(const std::string& rawHost, const std::string& strategyId,
-                                   long latencyMs) {
+                                   long latencyMs, const std::string& scope) {
     if (strategyId.empty()) return;
     const std::string host = normalizeHost(rawHost);
+    const std::string stateKey = stateKeyFor(host, scope);
     std::lock_guard<std::mutex> lock(m_mutex);
     const auto now = std::chrono::steady_clock::now();
-    HostState& state = m_cache[host];
+    HostState& state = m_cache[stateKey];
     state.preferred = strategyId;
     for (auto& entry : state.metrics) {
         HostState::Metric& metric = entry.second;
@@ -458,16 +545,26 @@ void StrategySelector::markSuccess(const std::string& rawHost, const std::string
             : (metric.latencyMs * 3 + latencyMs) / 4;
     }
     state.updated = now;
+    if (!isDirectId(strategyId) && !isTunnelId(strategyId)) {
+        if (scope.rfind("udp-", 0) == 0) {
+            m_networkPreferredUdp = strategyId;
+        } else if (scope.rfind("tcp-", 0) == 0) {
+            m_networkPreferredTcp = strategyId;
+        }
+    }
     saveCacheLocked();
     SKY_LOGI("StrategySelector: '%s' works for '%s'", strategyId.c_str(), host.c_str());
 }
 
-void StrategySelector::markFailure(const std::string& rawHost, const std::string& strategyId) {
+void StrategySelector::markFailure(const std::string& rawHost,
+                                   const std::string& strategyId,
+                                   const std::string& scope) {
     if (strategyId.empty()) return;
     const std::string host = normalizeHost(rawHost);
+    const std::string stateKey = stateKeyFor(host, scope);
     std::lock_guard<std::mutex> lock(m_mutex);
     const auto now = std::chrono::steady_clock::now();
-    HostState& state = m_cache[host];
+    HostState& state = m_cache[stateKey];
     HostState::Metric& metric = state.metrics[strategyId];
     metric.failures = decayedFailures(metric, now) + 1.0;
     metric.failedAt = now;
@@ -481,10 +578,11 @@ void StrategySelector::markFailure(const std::string& rawHost, const std::string
              strategyId.c_str(), host.c_str(), metric.failures);
 }
 
-std::string StrategySelector::cachedStrategy(const std::string& rawHost) const {
+std::string StrategySelector::cachedStrategy(const std::string& rawHost,
+                                             const std::string& scope) const {
     const std::string host = normalizeHost(rawHost);
     std::lock_guard<std::mutex> lock(m_mutex);
-    auto it = m_cache.find(host);
+    auto it = m_cache.find(stateKeyFor(host, scope));
     if (it == m_cache.end()) return {};
     if (std::chrono::steady_clock::now() - it->second.updated >= kCacheTtl) return {};
     return it->second.preferred;

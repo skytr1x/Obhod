@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -81,14 +82,16 @@ private:
 
     bool connectRemote(const std::string& host, uint16_t port, int& outFd,
                        struct sockaddr_storage* outAddr, socklen_t* outAddrLen,
-                       std::string& error);
+                       std::string& error, std::size_t addressOffset = 0,
+                       int timeoutMs = 8000);
     int waitForInitialData(int clientFd, int remoteFd, int timeoutMs);
     bool readInitialPayload(int clientFd, std::vector<uint8_t>& payload,
                             std::string& host, bool captureOpaqueHeader);
     bool sendFirstPayload(int fd, const std::vector<uint8_t>& payload,
                           const std::string& host, const StrategyChoice& choice,
                           SendOutcome& outcome);
-    bool waitForResponse(int fd, int timeoutMs, bool& readable, std::string& error);
+    bool waitForResponse(int fd, int timeoutMs, bool& readable,
+                         std::size_t& tlsHeaderBytes, std::string& error);
     void relay(int clientFd, int remoteFd, const std::string& host = {},
                uint16_t port = 0, bool reportStream = false, int idleTimeoutMs = 0);
 

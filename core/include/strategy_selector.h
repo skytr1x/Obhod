@@ -33,18 +33,24 @@ class StrategySelector {
 public:
     explicit StrategySelector(std::shared_ptr<Profile> profile);
 
-    std::shared_ptr<const Profile> profile() const;
-    StrategyChoice select(const std::string& host, bool udp = false) const;
-    std::vector<StrategyChoice> candidates(const std::string& host, bool udp = false) const;
+    StrategyChoice findStrategy(const std::string& id) const;
+    bool quicFallbackEnabled() const;
+    StrategyChoice select(const std::string& host, bool udp = false,
+                          const std::string& scope = std::string()) const;
+    std::vector<StrategyChoice> candidates(const std::string& host, bool udp = false,
+                                           const std::string& scope = std::string()) const;
 
     void markSuccess(const std::string& host, const std::string& strategyId,
-                     long latencyMs = -1);
-    void markFailure(const std::string& host, const std::string& strategyId);
+                     long latencyMs = -1, const std::string& scope = std::string());
+    void markFailure(const std::string& host, const std::string& strategyId,
+                     const std::string& scope = std::string());
 
     void setCachePath(const std::string& basePath);
     std::size_t setNetworkKey(const std::string& networkKey);
+    void setNetworkStrategyOrder(const std::string& tcpOrder);
 
-    std::string cachedStrategy(const std::string& host) const;
+    std::string cachedStrategy(const std::string& host,
+                               const std::string& scope = std::string()) const;
 
 private:
     struct HostState {
@@ -66,9 +72,14 @@ private:
     mutable std::unordered_map<std::string, HostState> m_cache;
     std::string m_cacheBasePath;
     std::string m_networkKey = "default";
+    std::vector<std::string> m_networkTcpOrder;
+    std::string m_networkPreferredTcp;
+    std::string m_networkPreferredUdp;
 
-    StrategyChoice routeLocked(const std::string& host, bool udp) const;
-    std::vector<StrategyChoice> candidatesLocked(const std::string& host, bool udp) const;
+    StrategyChoice routeLocked(const std::string& host, bool udp,
+                               const std::string& scope) const;
+    std::vector<StrategyChoice> candidatesLocked(const std::string& host, bool udp,
+                                                  const std::string& scope) const;
     static bool isUsable(const StrategyDef* strategy, bool udp);
 
     std::string cacheFileLocked() const;

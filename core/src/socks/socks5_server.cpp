@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdarg>
@@ -42,13 +43,44 @@ constexpr uint8_t SOCKS5_REP_ATYP_UNSUPPORTED = 0x08;
 constexpr int kConnectTimeoutMs = 8000;
 constexpr int kFirstPayloadTimeoutMs = 30000;
 
-constexpr int kResponseTimeoutMs = 3000;
-constexpr int kMaxStrategyAttempts = 16;
-constexpr int kStrategyBudgetMs = 18000;
+constexpr int kResponseTimeoutMs = 1500;
+constexpr int kMaxStrategyAttempts = 7;
+constexpr int kStrategyBudgetMs = 12000;
 constexpr int kRelayIdleTimeoutMs = 120000;
 constexpr int kRelayTunnelIdleTimeoutMs = 300000;
 constexpr std::size_t kMaxFirstPayload = 32768;
 constexpr std::size_t kMaxUdpPeers = 64;
+
+std::atomic<uint64_t> g_nextTcpRequestId{1};
+thread_local uint64_t g_tcpRequestId = 0;
+
+class TcpRequestLogScope {
+public:
+    explicit TcpRequestLogScope(uint64_t requestId)
+        : m_previous(g_tcpRequestId) {
+        g_tcpRequestId = requestId;
+    }
+
+    ~TcpRequestLogScope() { g_tcpRequestId = m_previous; }
+
+private:
+    uint64_t m_previous;
+};
+
+const char* eventErrorCategory(const std::string& error) {
+    if (error.find("timeout") != std::string::npos) return "timeout";
+    if (error.find("alert") != std::string::npos) return "tls_alert";
+    if (error.find("closed") != std::string::npos) return "server_closed";
+    if (error.find("truncated") != std::string::npos) return "truncated_response";
+    if (error.find("unexpected response") != std::string::npos) {
+        return "unexpected_response";
+    }
+    if (error.find("not a TLS") != std::string::npos) return "not_tls";
+    if (error.find("stopped") != std::string::npos) return "stopped";
+    if (error.find("send") != std::string::npos) return "send_failed";
+    if (error.find("reconnect") != std::string::npos) return "reconnect_failed";
+    return "transport_error";
+}
 
 bool isTelegramDcAddress(const std::string& host) {
     static constexpr const char* kTelegramIpv4Ranges[] = {
@@ -328,22 +360,88 @@ std::string udpKey(const std::string& host, uint16_t port) {
     return host + ':' + std::to_string(port);
 }
 
+bool readQuicVarInt(const uint8_t* data, std::size_t len, std::size_t& offset,
+                    uint64_t& value) {
+    if (offset >= len) return false;
+    const std::size_t byteCount = static_cast<std::size_t>(1) << (data[offset] >> 6);
+    if (byteCount > len - offset) return false;
+
+    value = data[offset] & 0x3f;
+    for (std::size_t i = 1; i < byteCount; ++i) {
+        value = (value << 8) | data[offset + i];
+    }
+    offset += byteCount;
+    return true;
+}
+
 bool isQuicInitial(const uint8_t* data, std::size_t len) {
-    if (len < 5 || (data[0] & 0xc0) != 0xc0) return false;
+    if (len < 7 || (data[0] & 0xc0) != 0xc0) return false;
     const uint32_t version = (static_cast<uint32_t>(data[1]) << 24) |
                              (static_cast<uint32_t>(data[2]) << 16) |
                              (static_cast<uint32_t>(data[3]) << 8) |
                              static_cast<uint32_t>(data[4]);
+    uint8_t initialType = 0;
     switch (version) {
-        case 0x00000001:  // QUIC v1
-        case 0x6b3343cf:  // QUIC v2
-        case 0x51303436:  // Q046
-        case 0x51303530:  // Q050
-        case 0x00000000:  // version negotiation
-            return true;
+        case 0x00000001:
+            initialType = 0x00;
+            break;
+        case 0x6b3343cf:
+            initialType = 0x10;
+            break;
         default:
             return false;
     }
+
+    if ((data[0] & 0x30) != initialType) return false;
+
+    std::size_t offset = 5;
+    const std::size_t destinationIdLength = data[offset++];
+    if (destinationIdLength > 20 || destinationIdLength > len - offset) return false;
+    offset += destinationIdLength;
+    if (offset >= len) return false;
+
+    const std::size_t sourceIdLength = data[offset++];
+    if (sourceIdLength > 20 || sourceIdLength > len - offset) return false;
+    offset += sourceIdLength;
+
+    uint64_t tokenLength = 0;
+    if (!readQuicVarInt(data, len, offset, tokenLength) ||
+        tokenLength > len - offset) {
+        return false;
+    }
+    offset += static_cast<std::size_t>(tokenLength);
+
+    uint64_t packetLength = 0;
+    return readQuicVarInt(data, len, offset, packetLength) && packetLength > 0 &&
+           packetLength <= len - offset;
+}
+
+bool isStunBindingRequest(const uint8_t* data, std::size_t len) {
+    constexpr std::size_t kStunHeaderSize = 20;
+    if (len < kStunHeaderSize || data[0] != 0x00 || data[1] != 0x01 ||
+        data[4] != 0x21 || data[5] != 0x12 || data[6] != 0xa4 || data[7] != 0x42) {
+        return false;
+    }
+
+    const std::size_t messageLength =
+        (static_cast<std::size_t>(data[2]) << 8) | data[3];
+    return (messageLength & 0x03) == 0 && messageLength == len - kStunHeaderSize;
+}
+
+bool prepareUdpFake(UdpPlan& plan, bool quicInitial, bool stunBindingRequest) {
+    if (plan.fakeCount <= 0) return false;
+
+    if ((plan.payload == "quic_google" || plan.payload == "quic") &&
+        stunBindingRequest && !quicInitial) {
+        plan.payload = "stun";
+    }
+
+    if (plan.payload == "quic_google" || plan.payload == "quic") {
+        return quicInitial;
+    }
+    if (plan.payload == "stun") return stunBindingRequest;
+    if (plan.payload == "zero") return quicInitial || stunBindingRequest;
+    return false;
 }
 
 std::vector<uint8_t> buildUdpResponse(const sockaddr* from, const uint8_t* data,
@@ -387,11 +485,18 @@ Socks5Server::~Socks5Server() {
 
 void Socks5Server::emitEvent(const char* format, ...) {
     if (!m_event) return;
-    char buffer[512];
+    char buffer[640];
     va_list args;
     va_start(args, format);
     std::vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
+    if (g_tcpRequestId != 0) {
+        char contextual[704];
+        std::snprintf(contextual, sizeof(contextual), "%s [tcp_id=%llu]",
+                      buffer, static_cast<unsigned long long>(g_tcpRequestId));
+        m_event(contextual);
+        return;
+    }
     m_event(buffer);
 }
 
@@ -660,7 +765,8 @@ bool Socks5Server::sendReply(int clientFd, uint8_t rep, const struct sockaddr* b
 
 bool Socks5Server::connectRemote(const std::string& host, uint16_t port, int& outFd,
                                  struct sockaddr_storage* outAddr, socklen_t* outAddrLen,
-                                 std::string& error) {
+                                 std::string& error, std::size_t addressOffset,
+                                 int timeoutMs) {
     std::vector<sockaddr_storage> addresses;
     std::vector<socklen_t> lengths;
     if (!resolve(host, port, SOCK_STREAM, addresses, lengths, error)) {
@@ -670,8 +776,23 @@ bool Socks5Server::connectRemote(const std::string& host, uint16_t port, int& ou
         }
         return false;
     }
+    if (addresses.empty()) {
+        error = "no resolved addresses";
+        return false;
+    }
 
-    for (std::size_t i = 0; i < addresses.size(); ++i) {
+    const std::size_t start = addressOffset % addresses.size();
+    const auto connectDeadline = std::chrono::steady_clock::now() +
+                                 std::chrono::milliseconds(std::max(timeoutMs, 1));
+    for (std::size_t attempt = 0; attempt < addresses.size(); ++attempt) {
+        const auto remainingMs =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                connectDeadline - std::chrono::steady_clock::now()).count();
+        if (remainingMs <= 0) break;
+        const std::size_t addressesRemaining = addresses.size() - attempt;
+        const int perAddressTimeout = std::max(
+            1, static_cast<int>(remainingMs / addressesRemaining));
+        const std::size_t i = (start + attempt) % addresses.size();
         const int fd = ::socket(addresses[i].ss_family,
                                 SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
         if (fd < 0) {
@@ -687,7 +808,7 @@ bool Socks5Server::connectRemote(const std::string& host, uint16_t port, int& ou
 
         if (!connectWithTimeout(fd,
                                 reinterpret_cast<const sockaddr*>(&addresses[i]),
-                                lengths[i], kConnectTimeoutMs, error, &m_running)) {
+                                lengths[i], perAddressTimeout, error, &m_running)) {
             SKY_LOGD("SOCKS5: connect %s:%u failed: %s", sockaddrText(
                          reinterpret_cast<const sockaddr*>(&addresses[i])).c_str(),
                      port, error.c_str());
@@ -792,8 +913,10 @@ bool Socks5Server::sendFirstPayload(int fd, const std::vector<uint8_t>& payload,
 }
 
 bool Socks5Server::waitForResponse(int fd, int timeoutMs, bool& readable,
+                                   std::size_t& tlsHeaderBytes,
                                    std::string& error) {
     readable = false;
+    tlsHeaderBytes = 0;
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(timeoutMs);
 
@@ -816,16 +939,51 @@ bool Socks5Server::waitForResponse(int fd, int timeoutMs, bool& readable,
             return false;
         }
 
-        uint8_t header[5] = {};
+        uint8_t header[6] = {};
         const ssize_t n = ::recv(fd, header, sizeof(header), MSG_PEEK | MSG_DONTWAIT);
         if (n > 0) {
+            tlsHeaderBytes = static_cast<std::size_t>(n);
+            if (n >= 5 && header[0] == 0x15) {
+                char detail[96];
+                std::snprintf(detail, sizeof(detail),
+                              "server returned TLS alert (version=0x%02x%02x, length=%u)",
+                              header[1], header[2],
+                              static_cast<unsigned>((header[3] << 8) | header[4]));
+                error = detail;
+                return false;
+            }
+            if (n < static_cast<ssize_t>(sizeof(header))) {
+                if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+                    char detail[80];
+                    std::snprintf(detail, sizeof(detail),
+                                  "truncated TLS ServerHello (%zd/6 bytes)", n);
+                    error = detail;
+                    return false;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
             if (header[0] != 0x16) {
-                error = header[0] == 0x15 ? "server returned a TLS alert"
-                                          : "unexpected response";
+                char detail[64];
+                std::snprintf(detail, sizeof(detail),
+                              "unexpected response byte=0x%02x", header[0]);
+                error = detail;
                 return false;
             }
             if (n >= 2 && header[1] != 0x03) {
-                error = "not a TLS record";
+                char detail[64];
+                std::snprintf(detail, sizeof(detail),
+                              "not a TLS record version=0x%02x%02x",
+                              header[1], header[2]);
+                error = detail;
+                return false;
+            }
+            if (header[5] != 0x02) {
+                char detail[64];
+                std::snprintf(detail, sizeof(detail),
+                              "unexpected TLS handshake message type=0x%02x",
+                              header[5]);
+                error = detail;
                 return false;
             }
             readable = true;
@@ -846,17 +1004,32 @@ bool Socks5Server::waitForResponse(int fd, int timeoutMs, bool& readable,
 }
 
 void Socks5Server::handleConnect(int clientFd, const Request& request) {
+    const uint64_t requestId = g_nextTcpRequestId.fetch_add(1);
+    [[maybe_unused]] TcpRequestLogScope requestLogScope(requestId);
     const std::string target = request.host + ':' + std::to_string(request.port);
     SKY_LOGI("SOCKS5: CONNECT %s", target.c_str());
 
     int remoteFd = -1;
     std::string error;
-    if (!connectRemote(request.host, request.port, remoteFd, nullptr, nullptr, error)) {
+    sockaddr_storage remoteAddress{};
+    socklen_t remoteAddressLen = 0;
+    if (!connectRemote(request.host, request.port, remoteFd, &remoteAddress,
+                       &remoteAddressLen, error)) {
+        if (m_running.load()) {
+            emitEvent("[PROBLEM] type=tcp_connect_failed host=%s port=%u reason=%s",
+                      request.host.c_str(), request.port,
+                      eventErrorCategory(error));
+        }
         SKY_LOGW("SOCKS5: CONNECT %s failed: %s", target.c_str(), error.c_str());
         sendReply(clientFd, SOCKS5_REP_HOST_UNREACHABLE);
         return;
     }
     trackFd(remoteFd);
+    auto connectedIp = [&remoteAddress, &remoteAddressLen]() {
+        return remoteAddressLen == 0
+            ? std::string("unknown")
+            : sockaddrText(reinterpret_cast<const sockaddr*>(&remoteAddress));
+    };
 
     if (!sendReply(clientFd, SOCKS5_REP_SUCCESS)) {
         closeTrackedFd(remoteFd);
@@ -883,31 +1056,26 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
         payload, request.host, request.port);
 
     const std::string host = payloadHost.empty() ? request.host : payloadHost;
+    const std::string strategyScope = "tcp-" + std::to_string(request.port);
     const PayloadInfo info = analyzePayload(payload.data(), payload.size());
     const bool tlsClientHello = info.kind == PayloadKind::TLS_CLIENT_HELLO;
     const bool completeClientHello =
         tlsClientHello && info.recordEnd > 0 && payload.size() >= info.recordEnd;
 
     std::string cached;
-    if (m_selector) cached = m_selector->cachedStrategy(host);
+    if (m_selector) cached = m_selector->cachedStrategy(host, strategyScope);
 
     std::vector<StrategyChoice> candidates;
     if (m_selector) {
-        candidates = m_selector->candidates(host, false);
+        candidates = m_selector->candidates(host, false, strategyScope);
     }
     if (mtprotoObfuscated && m_selector) {
-        const std::shared_ptr<const Profile> profile = m_selector->profile();
-        const StrategyDef* strategy = profile
-            ? profile->findStrategy("mtproto-obfs-split")
-            : nullptr;
+        StrategyChoice strategy = m_selector->findStrategy("mtproto-obfs-split");
         const bool explicitDirect = !candidates.empty() &&
             (candidates.front().direct ||
              (candidates.front().strategy && candidates.front().strategy->direct));
-        if (strategy && !explicitDirect) {
-            StrategyChoice choice;
-            choice.owner = profile;
-            choice.strategy = strategy;
-            candidates.insert(candidates.begin(), std::move(choice));
+        if (strategy.strategy && !explicitDirect) {
+            candidates.insert(candidates.begin(), std::move(strategy));
             emitEvent("[MTPROTO] obfuscated 64-byte handshake at %s:%u",
                       request.host.c_str(), request.port);
         }
@@ -918,8 +1086,13 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
         candidates.push_back(std::move(direct));
     }
 
-    if (candidates.size() > static_cast<std::size_t>(kMaxStrategyAttempts)) {
+    const std::size_t generatedCandidateCount = candidates.size();
+    const std::size_t profileCandidateLimit =
+        static_cast<std::size_t>(kMaxStrategyAttempts);
+    if (candidates.size() > profileCandidateLimit) {
         std::vector<StrategyChoice> limited;
+        std::vector<StrategyChoice> extraVariants;
+        std::set<const StrategyDef*> seenStrategies;
         StrategyChoice directChoice;
         bool hasDirect = false;
         for (auto& choice : candidates) {
@@ -930,10 +1103,16 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
                 }
                 continue;
             }
-            if (limited.size() + 1 >= static_cast<std::size_t>(kMaxStrategyAttempts)) {
-                break;
+            if (choice.strategy && seenStrategies.insert(choice.strategy).second &&
+                limited.size() + 1 < profileCandidateLimit) {
+                limited.push_back(choice);
+            } else {
+                extraVariants.push_back(choice);
             }
-            limited.push_back(choice);
+        }
+        for (auto& choice : extraVariants) {
+            if (limited.size() + 1 >= profileCandidateLimit) break;
+            limited.push_back(std::move(choice));
         }
         if (hasDirect) {
             limited.push_back(std::move(directChoice));
@@ -944,42 +1123,88 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
         }
         candidates.swap(limited);
     }
-
     const bool directOnly =
         candidates.size() == 1 &&
         (candidates.front().direct ||
          (candidates.front().strategy && candidates.front().strategy->direct));
     const bool logThis = !directOnly && shouldLogHost(host);
 
+    if (logThis) {
+        emitEvent("[TCP-PLAN] %s:%u remote_ip=%s generated=%zu candidates=%zu omitted_by_cap=%zu timeout_slots=%d response_timeout_ms=%d retry_budget_ms=%d cached=%s",
+                  host.c_str(), request.port, connectedIp().c_str(),
+                  generatedCandidateCount, candidates.size(),
+                  generatedCandidateCount - candidates.size(),
+                  kStrategyBudgetMs / kResponseTimeoutMs, kResponseTimeoutMs,
+                  kStrategyBudgetMs,
+                  cached.empty() ? "none" : cached.c_str());
+    }
+
     const auto planStart = std::chrono::steady_clock::now();
     const auto elapsed = [&planStart]() {
         return static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - planStart).count());
     };
+    const auto remainingBudget = [&elapsed]() {
+        return static_cast<int>(std::max<long long>(
+            0, static_cast<long long>(kStrategyBudgetMs) - elapsed()));
+    };
 
     bool verified = false;
     bool lastSendOk = false;
     bool budgetExhausted = false;
+    bool cancelled = false;
+    std::size_t lastTlsHeaderBytes = 0;
     std::size_t attemptsTried = 0;
+    std::string lastFailure;
+    const char* lastFailureStage = "none";
 
     for (std::size_t i = 0; i < candidates.size(); ++i) {
         const StrategyChoice& choice = candidates[i];
         const std::string strategyId = choice.key();
 
+        const int budgetMs = remainingBudget();
+        if (budgetMs == 0) {
+            budgetExhausted = true;
+            emitEvent("[GIVEUP] %s:%u retry budget %d ms exhausted after %zu attempt(s)",
+                      host.c_str(), request.port, kStrategyBudgetMs,
+                      attemptsTried);
+            break;
+        }
+
+        const std::size_t candidatesRemaining = candidates.size() - i;
+        const int candidateBudgetMs = std::max(
+            1, budgetMs / static_cast<int>(candidatesRemaining));
+        const auto candidateDeadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(candidateBudgetMs);
+        const auto candidateRemainingMs = [&candidateDeadline]() {
+            return static_cast<int>(std::max<long long>(
+                0, std::chrono::duration_cast<std::chrono::milliseconds>(
+                       candidateDeadline - std::chrono::steady_clock::now()).count()));
+        };
+
         if (i > 0) {
-            if (elapsed() >= kStrategyBudgetMs) {
-                budgetExhausted = true;
-                emitEvent("[GIVEUP] %s:%u retry budget %d ms exhausted after %zu attempt(s)",
-                          host.c_str(), request.port, kStrategyBudgetMs, attemptsTried);
-                break;
-            }
             closeTrackedFd(remoteFd);
             remoteFd = -1;
+            if (!m_running.load()) {
+                cancelled = true;
+                emitEvent("[CANCELLED] %s:%u stage=reconnect", host.c_str(),
+                          request.port);
+                break;
+            }
             if (!connectRemote(request.host, request.port, remoteFd,
-                               nullptr, nullptr, error)) {
+                               &remoteAddress, &remoteAddressLen, error, i,
+                               std::min(kConnectTimeoutMs, candidateRemainingMs()))) {
+                if (!m_running.load() || error == "stopped") {
+                    cancelled = true;
+                    emitEvent("[CANCELLED] %s:%u stage=reconnect", host.c_str(),
+                              request.port);
+                    break;
+                }
                 emitEvent("[FAIL] %s:%u via %s: reconnect failed: %s",
                           host.c_str(), request.port, strategyId.c_str(),
                           error.c_str());
+                lastFailure = error;
+                lastFailureStage = "reconnect";
                 lastSendOk = false;
                 continue;
             }
@@ -990,8 +1215,9 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
         ++attemptsTried;
         if (logThis || i > 0) {
             const bool cachedAttempt = i == 0 && !cached.empty() && cached == strategyId;
-            emitEvent("[TRY] %s:%u via %s (%s%zu/%zu)", host.c_str(), request.port,
-                      strategyId.c_str(), cachedAttempt ? "cached, " : "",
+            emitEvent("[TRY] %s:%u via %s remote_ip=%s (%s%zu/%zu)",
+                      host.c_str(), request.port, strategyId.c_str(),
+                      connectedIp().c_str(), cachedAttempt ? "cached, " : "",
                       attemptsTried, candidates.size());
         }
 
@@ -1002,18 +1228,26 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
             const long ms = static_cast<long>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - attemptStart).count());
-            emitEvent("[FAIL] %s:%u via %s: send failed: %s (%ld ms)",
+            if (!m_running.load() || outcome.error == "stopped") {
+                cancelled = true;
+                emitEvent("[CANCELLED] %s:%u stage=strategy_send",
+                          host.c_str(), request.port);
+                break;
+            }
+            emitEvent("[FAIL] %s:%u via %s remote_ip=%s: send failed: %s (%ld ms)",
                       host.c_str(), request.port, strategyId.c_str(),
-                      outcome.error.c_str(), ms);
+                      connectedIp().c_str(), outcome.error.c_str(), ms);
+            lastFailure = outcome.error;
+            lastFailureStage = "strategy_send";
             SKY_LOGW("SOCKS5: strategy '%s' failed to send: %s",
                      strategyId.c_str(), outcome.error.c_str());
             if (m_selector && choice.strategy) {
-                m_selector->markFailure(host, choice.key());
+                m_selector->markFailure(host, choice.key(), strategyScope);
             }
             continue;
         }
 
-        if (!completeClientHello) {
+        if (!completeClientHello || directOnly) {
             if (logThis) {
                 emitEvent("[SEND] %s:%u via %s (unverified first payload)",
                           host.c_str(), request.port, strategyId.c_str());
@@ -1023,13 +1257,18 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
         }
 
         bool readable = false;
+        std::size_t tlsHeaderBytes = 0;
         std::string responseError;
-        if (waitForResponse(remoteFd, kResponseTimeoutMs, readable, responseError)) {
+        if (waitForResponse(remoteFd, std::min(kResponseTimeoutMs,
+                                               candidateRemainingMs()),
+                            readable, tlsHeaderBytes, responseError)) {
             verified = true;
             const long ms = static_cast<long>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - attemptStart).count());
-            if (m_selector) m_selector->markSuccess(host, strategyId, ms);
+            if (m_selector) {
+                m_selector->markSuccess(host, strategyId, ms, strategyScope);
+            }
             const char* action = "split";
             if (choice.direct) {
                 action = "direct";
@@ -1041,23 +1280,35 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
                 action = "tlsrec";
             }
             if (logThis || i > 0 || attemptsTried > 1) {
-                emitEvent("[OK] %s:%u via %s (%ld ms, %s)", host.c_str(),
-                          request.port, strategyId.c_str(), ms, action);
+                emitEvent("[OK] %s:%u via %s remote_ip=%s (%ld ms, %s, TLS ServerHello observed)",
+                          host.c_str(), request.port, strategyId.c_str(),
+                          connectedIp().c_str(), ms, action);
             }
             SKY_LOGI("SOCKS5: %s via '%s' (%s, %ld ms)", target.c_str(),
                      strategyId.c_str(), action, ms);
             break;
         }
 
+        if (!m_running.load() || responseError == "stopped") {
+            cancelled = true;
+            emitEvent("[CANCELLED] %s:%u stage=tls_response",
+                      host.c_str(), request.port);
+            break;
+        }
+
         const long ms = static_cast<long>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - attemptStart).count());
-        emitEvent("[FAIL] %s:%u via %s: %s (%ld ms)", host.c_str(), request.port,
-                  strategyId.c_str(), responseError.c_str(), ms);
+        emitEvent("[FAIL] %s:%u via %s remote_ip=%s: %s (%ld ms)",
+                  host.c_str(), request.port, strategyId.c_str(),
+                  connectedIp().c_str(), responseError.c_str(), ms);
+        lastFailure = responseError;
+        lastFailureStage = "tls_response";
+        lastTlsHeaderBytes = tlsHeaderBytes;
         SKY_LOGW("SOCKS5: %s via '%s' failed: %s", target.c_str(),
                  strategyId.c_str(), responseError.c_str());
         if (m_selector && choice.strategy) {
-            m_selector->markFailure(host, choice.key());
+            m_selector->markFailure(host, choice.key(), strategyScope);
         }
 
         if (i + 1 >= candidates.size()) {
@@ -1067,7 +1318,16 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
         }
     }
 
-    if (!verified && completeClientHello && !budgetExhausted) {
+    if (cancelled || !m_running.load()) {
+        if (remoteFd >= 0) closeTrackedFd(remoteFd);
+        if (!cancelled) {
+            emitEvent("[CANCELLED] %s:%u stage=shutdown", host.c_str(),
+                      request.port);
+        }
+        return;
+    }
+
+    if (!verified && completeClientHello && !budgetExhausted && !directOnly) {
         emitEvent("[GIVEUP] %s:%u after %zu attempt(s) (%ld ms)", host.c_str(),
                   request.port, attemptsTried, elapsed());
     }
@@ -1075,28 +1335,61 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
         lastSendOk = false;
     }
 
+    const char* directReplayStatus = "not_needed";
     if (!lastSendOk) {
         emitEvent("[DIRECT] %s:%u final replay without desync", host.c_str(),
                   request.port);
         closeTrackedFd(remoteFd);
         remoteFd = -1;
         if (connectRemote(request.host, request.port, remoteFd,
-                          nullptr, nullptr, error)) {
+                          &remoteAddress, &remoteAddressLen, error, attemptsTried)) {
             trackFd(remoteFd);
             if (!sendAll(remoteFd, payload.data(), payload.size())) {
+                if (!m_running.load()) {
+                    emitEvent("[CANCELLED] %s:%u stage=direct_send",
+                              host.c_str(), request.port);
+                    closeTrackedFd(remoteFd);
+                    return;
+                }
                 emitEvent("[FAIL] %s:%u final direct send: %s", host.c_str(),
                           request.port, std::strerror(errno));
+                emitEvent("[PROBLEM] type=tcp_direct_replay_failed host=%s port=%u stage=send",
+                          host.c_str(), request.port);
                 SKY_LOGD("SOCKS5: final direct send failed: %s", std::strerror(errno));
                 closeTrackedFd(remoteFd);
                 return;
             }
+            directReplayStatus = "sent_unverified";
+            emitEvent("[DIRECT-RESULT] %s:%u remote_ip=%s status=sent_unverified",
+                      host.c_str(), request.port, connectedIp().c_str());
         } else {
+            if (!m_running.load() || error == "stopped") {
+                emitEvent("[CANCELLED] %s:%u stage=direct_reconnect",
+                          host.c_str(), request.port);
+                return;
+            }
             emitEvent("[FAIL] %s:%u final direct reconnect: %s", host.c_str(),
                       request.port, error.c_str());
+            emitEvent("[PROBLEM] type=tcp_direct_replay_failed host=%s port=%u stage=connect reason=%s",
+                      host.c_str(), request.port, eventErrorCategory(error));
             SKY_LOGW("SOCKS5: final reconnect to %s failed: %s",
                      target.c_str(), error.c_str());
             return;
         }
+    }
+
+    if (!verified && completeClientHello && !directOnly) {
+        const char* reason = eventErrorCategory(lastFailure);
+        const std::size_t untried = candidates.size() > attemptsTried
+            ? candidates.size() - attemptsTried
+            : 0;
+        emitEvent("[PROBLEM] type=tls_unverified host=%s port=%u remote_ip=%s attempted=%zu candidates=%zu generated=%zu untried=%zu omitted_by_cap=%zu elapsed_ms=%ld stage=%s reason=%s tls_header_bytes=%zu retry_budget=%s direct_replay=%s",
+                  host.c_str(), request.port, connectedIp().c_str(),
+                  attemptsTried, candidates.size(), generatedCandidateCount,
+                  untried, generatedCandidateCount - candidates.size(), elapsed(),
+                  lastFailureStage, reason, lastTlsHeaderBytes,
+                  budgetExhausted ? "exhausted" : "available",
+                  directReplayStatus);
     }
 
     relay(clientFd, remoteFd, host, request.port, !completeClientHello,
@@ -1194,9 +1487,7 @@ void Socks5Server::relayUdp(int clientFd, int relayFd) {
     uint64_t totalReceivedPackets = 0;
     uint64_t totalSentBytes = 0;
     uint64_t totalReceivedBytes = 0;
-    const std::shared_ptr<const Profile> profile =
-        m_selector ? m_selector->profile() : nullptr;
-    const bool blockQuic = profile && profile->quicFallback;
+    const bool blockQuic = m_selector && m_selector->quicFallbackEnabled();
     const auto fakeRetry = std::chrono::seconds(10);
     const auto fakeRefresh = std::chrono::seconds(30);
 
@@ -1281,9 +1572,11 @@ void Socks5Server::relayUdp(int clientFd, int relayFd) {
                             const uint8_t* payload = data + offset;
                             const std::size_t payloadLen =
                                 static_cast<std::size_t>(n) - offset;
+                            const bool quicInitial = isQuicInitial(payload, payloadLen);
+                            const bool stunBindingRequest =
+                                isStunBindingRequest(payload, payloadLen);
 
-                            if (blockQuic && port == 443 &&
-                                isQuicInitial(payload, payloadLen)) {
+                            if (blockQuic && port == 443 && quicInitial) {
                                 if (shouldLogHost("quic:" + host)) {
                                     emitEvent("[UDP-QUIC-BLOCK] %s forced TCP fallback",
                                               formatEndpoint(host, port).c_str());
@@ -1321,13 +1614,17 @@ void Socks5Server::relayUdp(int clientFd, int relayFd) {
                                 const auto fakeInterval = peer.udpVerified
                                     ? fakeRefresh
                                     : fakeRetry;
+                                const std::string strategyScope =
+                                    "udp-" + std::to_string(port);
                                 const bool fakeDue = peer.lastFakeAt.time_since_epoch().count() == 0 ||
                                     now - peer.lastFakeAt >= fakeInterval;
-                                if (m_selector && fakePort && fakeDue) {
+                                if (m_selector && fakePort && fakeDue &&
+                                    (quicInitial || stunBindingRequest)) {
                                     if (!peer.strategyKey.empty() && !peer.udpVerified &&
                                         peer.receivedPackets == peer.rxAtLastFake &&
                                         peer.sentPackets > peer.txAtLastFake) {
-                                        m_selector->markFailure(host, peer.strategyKey);
+                                        m_selector->markFailure(host, peer.strategyKey,
+                                                                strategyScope);
                                         emitEvent("[UDP-FAIL] %s via %s",
                                                   formatEndpoint(host, port).c_str(),
                                                   peer.strategyKey.c_str());
@@ -1335,32 +1632,31 @@ void Socks5Server::relayUdp(int clientFd, int relayFd) {
                                     }
 
                                     const StrategyChoice choice =
-                                        m_selector->select(host, true);
+                                        m_selector->select(host, true, strategyScope);
                                     if (choice.strategy && choice.strategy->udp.valid &&
                                         choice.strategy->udp.fakeCount > 0) {
                                         UdpPlan plan = choice.strategy->udp;
-                                        if (port != 443 && plan.payload == "quic_google") {
-                                            plan.payload = "stun";
-                                        }
-                                        DesyncEngine engine;
-                                        const bool ok = engine.sendUdpFakes(
-                                            peer.fd, plan, nullptr, 0, choice.ttl);
-                                        if (!ok || shouldLogHost("udp:" + host)) {
-                                            emitEvent("[UDP] %s via %s (%s)",
-                                                      formatEndpoint(host, port).c_str(),
-                                                      choice.key().c_str(),
-                                                      ok ? "fake sent" : "fake failed");
-                                        }
-                                        peer.strategyKey = choice.key();
-                                        peer.lastFakeAt = now;
-                                        peer.rxAtLastFake = peer.receivedPackets;
-                                        peer.txAtLastFake = peer.sentPackets;
-                                        if (ok) {
-                                            // Micro-jitter between fake and the real datagram.
-                                            const auto jitterUs =
-                                                (peer.sentPackets * 7919u + 137u) % 3000u;
-                                            std::this_thread::sleep_for(
-                                                std::chrono::microseconds(jitterUs));
+                                        if (prepareUdpFake(plan, quicInitial,
+                                                           stunBindingRequest)) {
+                                            DesyncEngine engine;
+                                            const bool ok = engine.sendUdpFakes(
+                                                peer.fd, plan, nullptr, 0, choice.ttl);
+                                            if (!ok || shouldLogHost("udp:" + host)) {
+                                                emitEvent("[UDP] %s via %s (%s)",
+                                                          formatEndpoint(host, port).c_str(),
+                                                          choice.key().c_str(),
+                                                          ok ? "fake sent" : "fake failed");
+                                            }
+                                            peer.strategyKey = choice.key();
+                                            peer.lastFakeAt = now;
+                                            peer.rxAtLastFake = peer.receivedPackets;
+                                            peer.txAtLastFake = peer.sentPackets;
+                                            if (ok) {
+                                                const auto jitterUs =
+                                                    (peer.sentPackets * 7919u + 137u) % 3000u;
+                                                std::this_thread::sleep_for(
+                                                    std::chrono::microseconds(jitterUs));
+                                            }
                                         }
                                     }
                                 }
@@ -1438,7 +1734,9 @@ void Socks5Server::relayUdp(int clientFd, int relayFd) {
                     ? -1
                     : static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
                           now - peer.lastFakeAt).count());
-                m_selector->markSuccess(peer.host, peer.strategyKey, latencyMs);
+                m_selector->markSuccess(
+                    peer.host, peer.strategyKey, latencyMs,
+                    "udp-" + std::to_string(peer.port));
             }
             if (peer.receivedPackets == 1 ||
                 now - peer.lastRxLog >= std::chrono::seconds(5)) {

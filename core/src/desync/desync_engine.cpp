@@ -322,6 +322,9 @@ SendOutcome DesyncEngine::sendWithPlan(int fd, const std::uint8_t* data, std::si
                     outcome.fatal = true;
                     return outcome;
                 }
+                if (!waitUntilSent(fd, 50)) {
+                    SKY_LOGD("Desync split boundary was not confirmed for '%s'", host.c_str());
+                }
                 lp = pos;
                 break;
             }
@@ -416,24 +419,36 @@ bool DesyncEngine::sendUdpFakes(int fd, const UdpPlan& plan,
                                 socklen_t destinationLen, int ttlOverride) {
     if (plan.fakeCount <= 0) return true;
     const std::vector<std::uint8_t> payload = fakePayload(plan.payload, {});
-    if (payload.empty()) return true;
+    if (payload.empty()) return false;
 
     const int fakeTtl = ttlOverride > 0 ? ttlOverride
                                         : (plan.ttl > 0 ? plan.ttl : 8);
     if (!setTtl(fd, fakeTtl)) return false;
     bool ok = true;
+    int sendError = 0;
     for (int i = 0; i < plan.fakeCount; ++i) {
-        const ssize_t n = destination
-            ? ::sendto(fd, payload.data(), payload.size(), MSG_NOSIGNAL,
-                       destination, destinationLen)
-            : ::send(fd, payload.data(), payload.size(), MSG_NOSIGNAL);
-        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        ssize_t n = -1;
+        do {
+            n = destination
+                ? ::sendto(fd, payload.data(), payload.size(), MSG_NOSIGNAL,
+                           destination, destinationLen)
+                : ::send(fd, payload.data(), payload.size(), MSG_NOSIGNAL);
+        } while (n < 0 && errno == EINTR);
+
+        if (n < 0 || static_cast<std::size_t>(n) != payload.size()) {
             ok = false;
+            sendError = n < 0 ? errno : EIO;
             break;
         }
     }
-    setTtl(fd, m_defaultTtl);
-    return ok;
+    if (!ok) {
+        SKY_LOGD("Desync UDP fake send failed: %s", std::strerror(sendError));
+    }
+    const bool restored = setTtl(fd, m_defaultTtl);
+    if (!restored) {
+        SKY_LOGW("Desync UDP fake could not restore TTL=%d", m_defaultTtl);
+    }
+    return ok && restored;
 }
 
 }

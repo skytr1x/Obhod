@@ -23,7 +23,6 @@ public:
     explicit JsonValue(double v) : type(Type::Number), numberValue(v) {}
     explicit JsonValue(std::string v) : type(Type::String), stringValue(std::move(v)) {}
 
-    bool isNull() const { return type == Type::Null; }
     bool isObject() const { return type == Type::Object; }
     bool isArray() const { return type == Type::Array; }
     bool isString() const { return type == Type::String; }

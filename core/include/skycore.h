@@ -34,6 +34,7 @@ public:
     void start();
     void stop();
     void setNetworkKey(const std::string& networkKey);
+    void setNetworkStrategyOrder(const std::string& tcpOrder);
     std::string getStatsJson();
 
 private:

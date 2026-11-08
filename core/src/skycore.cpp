@@ -38,6 +38,10 @@ void SkyCore::setNetworkKey(const std::string& networkKey) {
     }
 }
 
+void SkyCore::setNetworkStrategyOrder(const std::string& tcpOrder) {
+    if (m_selector) m_selector->setNetworkStrategyOrder(tcpOrder);
+}
+
 SkyCore::~SkyCore() {
     stop();
 }

@@ -95,7 +95,11 @@ void HostList::add(const std::string& raw) {
     if (p.text.empty()) return;
     p.wildcard = p.text.find('*') != std::string::npos ||
                  p.text.find('?') != std::string::npos;
-    m_patterns.push_back(std::move(p));
+    if (p.wildcard) {
+        m_patterns.push_back(std::move(p));
+    } else {
+        m_domains.insert(std::move(p.text));
+    }
 }
 
 void HostList::addText(const std::string& text) {
@@ -114,12 +118,21 @@ void HostList::addText(const std::string& text) {
 }
 
 void HostList::clear() {
+    m_domains.clear();
     m_patterns.clear();
 }
 
 bool HostList::matches(const std::string& rawHost) const {
     const std::string host = normalizeHost(rawHost);
     if (host.empty()) return false;
+
+    std::size_t labelStart = 0;
+    while (labelStart <= host.size()) {
+        if (m_domains.find(host.substr(labelStart)) != m_domains.end()) return true;
+        const std::size_t dot = host.find('.', labelStart);
+        if (dot == std::string::npos) break;
+        labelStart = dot + 1;
+    }
 
     for (const auto& p : m_patterns) {
         if (p.wildcard) {

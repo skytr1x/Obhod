@@ -1,4 +1,4 @@
-package com.skytr1x.obhod
+package com.skytr1x.obhod.strategy
 
 data class StrategyProfileOption(
     val id: String,
@@ -7,9 +7,14 @@ data class StrategyProfileOption(
 )
 
 object StrategyProfiles {
-    const val DEFAULT_ID = "flowseal-general-mobile"
+    const val DEFAULT_ID = "list"
 
     val options = listOf(
+        StrategyProfileOption(
+            "list",
+            "List",
+            "Точечно сплитит запросы. Требует периодического обновления списка домейнов."
+        ),
         StrategyProfileOption(
             "flowseal-general-mobile",
             "General",

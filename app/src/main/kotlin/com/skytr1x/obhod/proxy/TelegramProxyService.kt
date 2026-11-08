@@ -1,25 +1,20 @@
-package com.skytr1x.obhod
+package com.skytr1x.obhod.proxy
 
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
-import android.util.Log
-import androidx.core.app.NotificationCompat
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import com.skytr1x.obhod.logging.AppLog
+import com.skytr1x.obhod.notification.ObhodNotifications
 
 class TelegramProxyService : Service() {
     companion object {
         const val ACTION_START = "com.skytr1x.obhod.telegram.START"
         const val ACTION_STOP = "com.skytr1x.obhod.telegram.STOP"
         const val ACTION_STATE_CHANGED = "com.skytr1x.obhod.telegram.STATE_CHANGED"
-        private const val CHANNEL_ID = "telegram_proxy"
-        private const val NOTIFICATION_ID = 41
         private const val TAG = "TelegramProxyService"
     }
 
@@ -29,8 +24,7 @@ class TelegramProxyService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.createNotificationChannel(NotificationChannel(CHANNEL_ID, "Прокси Telegram", NotificationManager.IMPORTANCE_LOW))
+        ObhodNotifications.createChannel(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -45,6 +39,8 @@ class TelegramProxyService : Service() {
         if (running) return
         if (starting) return
         starting = true
+        ObhodNotifications.markStarting(this, "telegram_proxy")
+        AppLog.i(TAG, "Запуск прокси Телеграм")
         startForegroundCompat()
         proxyExecutor.execute {
             try {
@@ -58,13 +54,12 @@ class TelegramProxyService : Service() {
                 running = true
                 starting = false
                 publishState(true)
-                Log.i(TAG, "Telegram MTProto proxy listening on ${TelegramProxyConfig.HOST}:${TelegramProxyConfig.PORT}")
-                updateNotification("Обход Телеграм включён")
+                AppLog.i(TAG, "MTProto слушает ${TelegramProxyConfig.HOST}:${TelegramProxyConfig.PORT}")
             } catch (error: Throwable) {
-                Log.e(TAG, "Telegram proxy startup failed", error)
+                AppLog.e(TAG, "Не удалось запустить прокси Телеграм", error)
                 starting = false
+                stopForeground(STOP_FOREGROUND_DETACH)
                 publishState(false)
-                stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
         }
@@ -76,37 +71,38 @@ class TelegramProxyService : Service() {
             try {
                 if (running || starting) NativeTelegramProxy.stop()
             } catch (error: Throwable) {
-                Log.e(TAG, "Telegram proxy shutdown failed", error)
+                AppLog.e(TAG, "Ошибка остановки прокси Телеграм", error)
             } finally {
                 running = false
+                stopForeground(STOP_FOREGROUND_DETACH)
                 publishState(false)
-                stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
         }
     }
 
     private fun startForegroundCompat() {
-        val notification = buildNotification("Запуск обхода Telegram…")
+        val notification = ObhodNotifications.build(this)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        } else startForeground(NOTIFICATION_ID, notification)
+            startForeground(
+                ObhodNotifications.NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            )
+        } else startForeground(ObhodNotifications.NOTIFICATION_ID, notification)
     }
-
-    private fun updateNotification(text: String) {
-        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification(text))
-    }
-
-    private fun buildNotification(text: String) = NotificationCompat.Builder(this, CHANNEL_ID)
-        .setSmallIcon(android.R.drawable.stat_sys_download_done)
-        .setContentTitle("Прокси Telegram")
-        .setContentText(text)
-        .setOngoing(true)
-        .setContentIntent(PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
-        .build()
 
     private fun publishState(value: Boolean) {
-        getSharedPreferences("telegram_proxy", MODE_PRIVATE).edit().putBoolean("running", value).apply()
+        val prefs = getSharedPreferences("telegram_proxy", MODE_PRIVATE)
+        val wasRunning = prefs.getBoolean("running", false)
+        prefs.edit()
+            .putBoolean("running", value)
+            .putBoolean("starting", false)
+            .apply()
+        ObhodNotifications.refresh(this)
+        if (wasRunning != value) {
+            AppLog.i("Telegram", if (value) "Прокси Телеграм включён" else "Прокси Телеграм выключен")
+        }
         sendBroadcast(Intent(ACTION_STATE_CHANGED).setPackage(packageName))
     }
 
@@ -114,6 +110,7 @@ class TelegramProxyService : Service() {
         if (running) runCatching { NativeTelegramProxy.stop() }
         running = false
         starting = false
+        stopForeground(STOP_FOREGROUND_DETACH)
         publishState(false)
         proxyExecutor.shutdown()
         super.onDestroy()

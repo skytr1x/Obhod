@@ -2,6 +2,7 @@
 #define HOST_LIST_H
 
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace skyunblock {
@@ -13,7 +14,7 @@ public:
     void add(const std::string& pattern);
     void addText(const std::string& text);
     void clear();
-    bool empty() const { return m_patterns.empty(); }
+    bool empty() const { return m_domains.empty() && m_patterns.empty(); }
     bool matches(const std::string& host) const;
 
 private:
@@ -23,6 +24,7 @@ private:
         bool wildcard = false;
     };
 
+    std::unordered_set<std::string> m_domains;
     std::vector<Pattern> m_patterns;
 };
 

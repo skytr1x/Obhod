@@ -23,7 +23,7 @@ static std::mutex g_tunnelMutex;
 extern "C" {
 
 JNIEXPORT jboolean JNICALL
-Java_com_skytr1x_obhod_NativeBridge_startTunnel(JNIEnv* env, jclass clazz, jint tunFd, jstring configPath) {
+Java_com_skytr1x_obhod_bridge_NativeBridge_startTunnel(JNIEnv* env, jclass clazz, jint tunFd, jstring configPath) {
     std::lock_guard<std::mutex> lock(g_tunnelMutex);
     if (g_tunnelRunning.load()) {
         LOGD("startTunnel: already running");
@@ -68,7 +68,7 @@ Java_com_skytr1x_obhod_NativeBridge_startTunnel(JNIEnv* env, jclass clazz, jint 
 }
 
 JNIEXPORT void JNICALL
-Java_com_skytr1x_obhod_NativeBridge_stopTunnel(JNIEnv* env, jclass clazz) {
+Java_com_skytr1x_obhod_bridge_NativeBridge_stopTunnel(JNIEnv* env, jclass clazz) {
     std::lock_guard<std::mutex> lock(g_tunnelMutex);
     LOGD("stopTunnel called");
     if (!g_tunnelRunning.load() && !g_tunnelThread.joinable()) {
@@ -80,11 +80,6 @@ Java_com_skytr1x_obhod_NativeBridge_stopTunnel(JNIEnv* env, jclass clazz) {
     if (g_tunnelThread.joinable()) g_tunnelThread.join();
 #endif
     g_tunnelRunning.store(false);
-}
-
-JNIEXPORT jboolean JNICALL
-Java_com_skytr1x_obhod_NativeBridge_isTunnelRunning(JNIEnv* env, jclass clazz) {
-    return g_tunnelRunning.load() ? JNI_TRUE : JNI_FALSE;
 }
 
 }

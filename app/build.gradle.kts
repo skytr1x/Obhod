@@ -1,13 +1,32 @@
 import org.gradle.api.tasks.Exec
+import java.util.Properties
 
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
+}
+
+val releaseSigningFile = rootProject.file("keystore.properties")
+val releaseSigningProperties = Properties().apply {
+    if (releaseSigningFile.isFile) {
+        releaseSigningFile.inputStream().use { load(it) }
+    }
+}
+if (releaseSigningFile.isFile) {
+    val requiredProperties = listOf("storeFile", "storePassword", "keyAlias", "keyPassword")
+    val missingProperties = requiredProperties.filter {
+        releaseSigningProperties.getProperty(it).isNullOrBlank()
+    }
+    check(missingProperties.isEmpty()) {
+        "Missing ${missingProperties.joinToString()} in ${releaseSigningFile.name}"
+    }
 }
 
 android {
     namespace = "com.skytr1x.obhod"
-    compileSdk = 34
+    compileSdk = 36
+    buildToolsVersion = "36.0.0"
 
     defaultConfig {
         applicationId = "com.skytr1x.obhod"
@@ -15,7 +34,7 @@ android {
         targetSdk = 34
         ndkVersion = "27.2.12479018"
         versionCode = 1
-        versionName = "1.2"
+        versionName = "1.3"
 
         ndk {
             abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a", "x86_64"))
@@ -32,8 +51,22 @@ android {
         }
     }
 
+    if (releaseSigningFile.isFile) {
+        signingConfigs {
+            create("release") {
+                storeFile = rootProject.file(releaseSigningProperties.getProperty("storeFile"))
+                storePassword = releaseSigningProperties.getProperty("storePassword")
+                keyAlias = releaseSigningProperties.getProperty("keyAlias")
+                keyPassword = releaseSigningProperties.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
+            if (releaseSigningFile.isFile) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
@@ -43,6 +76,10 @@ android {
         }
         debug {
         }
+    }
+
+    buildFeatures {
+        compose = true
     }
 
     externalNativeBuild {
@@ -130,5 +167,9 @@ tasks.named("preBuild").configure {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("androidx.activity:activity-compose:1.9.3")
+    implementation("androidx.compose.ui:ui:1.10.4")
+    implementation("androidx.compose.foundation:foundation:1.10.4")
+    implementation("androidx.compose.material3:material3:1.4.0")
     implementation("net.java.dev.jna:jna:5.14.0@aar")
 }

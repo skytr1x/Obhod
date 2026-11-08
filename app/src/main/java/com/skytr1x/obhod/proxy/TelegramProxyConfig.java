@@ -1,9 +1,10 @@
-package com.skytr1x.obhod;
+package com.skytr1x.obhod.proxy;
 
 import android.content.Context;
 import android.content.SharedPreferences;
 
 import java.security.SecureRandom;
+import java.util.Locale;
 
 public final class TelegramProxyConfig {
     public static final String HOST = "127.0.0.1";
@@ -18,7 +19,7 @@ public final class TelegramProxyConfig {
         SharedPreferences preferences = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         String current = preferences.getString(SECRET_KEY, null);
         if (current != null && current.matches("[0-9a-fA-F]{32}")) {
-            return current.toLowerCase();
+            return current.toLowerCase(Locale.ROOT);
         }
 
         byte[] bytes = new byte[16];

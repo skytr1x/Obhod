@@ -23,7 +23,7 @@ if(EXISTS "${HEV_DIR}/CMakeLists.txt" OR EXISTS "${HEV_DIR}/Makefile")
         SOURCE_DIR      "${HEV_DIR}"
         CONFIGURE_COMMAND ""
         BUILD_COMMAND
-            sh -c "make clean -C ${HEV_DIR} && make static -C ${HEV_DIR} CC=${CMAKE_C_COMPILER} AR=${CMAKE_AR} STRIP=${CMAKE_STRIP} \"CFLAGS=${CMAKE_C_FLAGS} --target=${CMAKE_C_COMPILER_TARGET} -fPIC\" && mkdir -p ${HEV_BUILD_DIR}/bin && cp ${HEV_DIR}/bin/*.a ${HEV_BUILD_DIR}/bin/ && mkdir -p ${HEV_BUILD_DIR}/third-part/yaml/bin && cp ${HEV_DIR}/third-part/yaml/bin/*.a ${HEV_BUILD_DIR}/third-part/yaml/bin/ && mkdir -p ${HEV_BUILD_DIR}/third-part/lwip/bin && cp ${HEV_DIR}/third-part/lwip/bin/*.a ${HEV_BUILD_DIR}/third-part/lwip/bin/ && mkdir -p ${HEV_BUILD_DIR}/third-part/hev-task-system/bin && cp ${HEV_DIR}/third-part/hev-task-system/bin/*.a ${HEV_BUILD_DIR}/third-part/hev-task-system/bin/"
+            sh -c "make clean -C ${HEV_DIR} && make static -C ${HEV_DIR} CC=${CMAKE_C_COMPILER} AR=${CMAKE_AR} STRIP=${CMAKE_STRIP} \"CFLAGS=${CMAKE_C_FLAGS} --target=${CMAKE_C_COMPILER_TARGET} -fPIC -Wno-unused-command-line-argument\" && mkdir -p ${HEV_BUILD_DIR}/bin && cp ${HEV_DIR}/bin/*.a ${HEV_BUILD_DIR}/bin/ && mkdir -p ${HEV_BUILD_DIR}/third-part/yaml/bin && cp ${HEV_DIR}/third-part/yaml/bin/*.a ${HEV_BUILD_DIR}/third-part/yaml/bin/ && mkdir -p ${HEV_BUILD_DIR}/third-part/lwip/bin && cp ${HEV_DIR}/third-part/lwip/bin/*.a ${HEV_BUILD_DIR}/third-part/lwip/bin/ && mkdir -p ${HEV_BUILD_DIR}/third-part/hev-task-system/bin && cp ${HEV_DIR}/third-part/hev-task-system/bin/*.a ${HEV_BUILD_DIR}/third-part/hev-task-system/bin/"
         BUILD_IN_SOURCE 1
         INSTALL_COMMAND ""
         BUILD_BYPRODUCTS "${HEV_LIB}" "${HEV_YAML_LIB}" "${HEV_LWIP_LIB}" "${HEV_TASK_LIB}"
@@ -58,6 +58,22 @@ set(SOURCES
 )
 
 add_library(skycore SHARED ${SOURCES})
+
+include(CTest)
+if(BUILD_TESTING AND NOT ANDROID)
+    add_executable(strategy_selector_test
+        tests/strategy_selector_test.cpp
+        src/strategy/profile.cpp
+        src/strategy/strategy_selector.cpp
+        src/util/host_list.cpp
+        src/util/json.cpp
+    )
+    target_compile_definitions(strategy_selector_test PRIVATE
+        SKY_HOST_BUILD=1
+        SKY_LIST_PROFILE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../app/src/main/assets/strategies/list.json"
+    )
+    add_test(NAME list_strategy_routing COMMAND strategy_selector_test)
+endif()
 
 target_compile_definitions(skycore PRIVATE _GNU_SOURCE=1)
 

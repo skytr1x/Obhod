@@ -1,4 +1,4 @@
-package com.skytr1x.obhod;
+package com.skytr1x.obhod.bridge;
 
 import android.util.Log;
 
@@ -26,6 +26,7 @@ public final class NativeBridge {
     public static native void stop(long handle);
     public static native void destroy(long handle);
     public static native void setNetworkKey(long handle, String networkKey);
+    public static native void setNetworkStrategyOrder(long handle, String tcpOrder);
     public static native String getStatsJson(long handle);
     public static native boolean startTunnel(int tunFd, String configPath);
     public static native void stopTunnel();

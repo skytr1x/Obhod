@@ -84,7 +84,7 @@ struct JniCallbackRefs {
 }
 
 JNIEXPORT jlong JNICALL
-Java_com_skytr1x_obhod_NativeBridge_create(JNIEnv* env, jclass clazz, jstring configPath, jobject protector, jobject listener) {
+Java_com_skytr1x_obhod_bridge_NativeBridge_create(JNIEnv* env, jclass clazz, jstring configPath, jobject protector, jobject listener) {
     LOGD("JNI: create() called");
     if (!configPath) {
         LOGE("JNI: configPath is null");
@@ -196,7 +196,7 @@ Java_com_skytr1x_obhod_NativeBridge_create(JNIEnv* env, jclass clazz, jstring co
 }
 
 JNIEXPORT void JNICALL
-Java_com_skytr1x_obhod_NativeBridge_start(JNIEnv* env, jclass clazz, jlong handle) {
+Java_com_skytr1x_obhod_bridge_NativeBridge_start(JNIEnv* env, jclass clazz, jlong handle) {
     LOGD("JNI: start() called with handle %p", (void*)handle);
     auto core = reinterpret_cast<skyunblock::SkyCore*>(handle);
     if (core) {
@@ -207,7 +207,7 @@ Java_com_skytr1x_obhod_NativeBridge_start(JNIEnv* env, jclass clazz, jlong handl
 }
 
 JNIEXPORT void JNICALL
-Java_com_skytr1x_obhod_NativeBridge_stop(JNIEnv* env, jclass clazz, jlong handle) {
+Java_com_skytr1x_obhod_bridge_NativeBridge_stop(JNIEnv* env, jclass clazz, jlong handle) {
     LOGD("JNI: stop() called with handle %p", (void*)handle);
     auto core = reinterpret_cast<skyunblock::SkyCore*>(handle);
     if (core) {
@@ -216,7 +216,7 @@ Java_com_skytr1x_obhod_NativeBridge_stop(JNIEnv* env, jclass clazz, jlong handle
 }
 
 JNIEXPORT void JNICALL
-Java_com_skytr1x_obhod_NativeBridge_destroy(JNIEnv* env, jclass clazz, jlong handle) {
+Java_com_skytr1x_obhod_bridge_NativeBridge_destroy(JNIEnv* env, jclass clazz, jlong handle) {
     LOGD("JNI: destroy() called with handle %p", (void*)handle);
     auto core = reinterpret_cast<skyunblock::SkyCore*>(handle);
     if (core) {
@@ -225,7 +225,7 @@ Java_com_skytr1x_obhod_NativeBridge_destroy(JNIEnv* env, jclass clazz, jlong han
 }
 
 JNIEXPORT void JNICALL
-Java_com_skytr1x_obhod_NativeBridge_setNetworkKey(JNIEnv* env, jclass clazz, jlong handle,
+Java_com_skytr1x_obhod_bridge_NativeBridge_setNetworkKey(JNIEnv* env, jclass clazz, jlong handle,
                                                jstring networkKey) {
     auto core = reinterpret_cast<skyunblock::SkyCore*>(handle);
     if (!core) return;
@@ -241,8 +241,25 @@ Java_com_skytr1x_obhod_NativeBridge_setNetworkKey(JNIEnv* env, jclass clazz, jlo
     core->setNetworkKey(key);
 }
 
+JNIEXPORT void JNICALL
+Java_com_skytr1x_obhod_bridge_NativeBridge_setNetworkStrategyOrder(
+    JNIEnv* env, jclass clazz, jlong handle, jstring tcpOrder) {
+    auto core = reinterpret_cast<skyunblock::SkyCore*>(handle);
+    if (!core) return;
+
+    std::string order;
+    if (tcpOrder) {
+        const char* text = env->GetStringUTFChars(tcpOrder, nullptr);
+        if (text) {
+            order.assign(text);
+            env->ReleaseStringUTFChars(tcpOrder, text);
+        }
+    }
+    core->setNetworkStrategyOrder(order);
+}
+
 JNIEXPORT jstring JNICALL
-Java_com_skytr1x_obhod_NativeBridge_getStatsJson(JNIEnv* env, jclass clazz, jlong handle) {
+Java_com_skytr1x_obhod_bridge_NativeBridge_getStatsJson(JNIEnv* env, jclass clazz, jlong handle) {
     auto core = reinterpret_cast<skyunblock::SkyCore*>(handle);
     if (!core) return nullptr;
 

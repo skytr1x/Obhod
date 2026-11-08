@@ -1,4 +1,4 @@
-package com.skytr1x.obhod
+package com.skytr1x.obhod.proxy
 
 import com.sun.jna.Library
 import com.sun.jna.Native
