@@ -44,6 +44,8 @@ public:
                      long latencyMs = -1, const std::string& scope = std::string());
     void markFailure(const std::string& host, const std::string& strategyId,
                      const std::string& scope = std::string());
+    void markHostUnavailable(const std::string& host, const std::string& scope);
+    bool hostUnavailableCached(const std::string& host, const std::string& scope) const;
 
     void setCachePath(const std::string& basePath);
     std::size_t setNetworkKey(const std::string& networkKey);
@@ -65,6 +67,7 @@ private:
         std::string preferred;
         std::unordered_map<std::string, Metric> metrics;
         std::chrono::steady_clock::time_point updated;
+        std::chrono::steady_clock::time_point unavailableUntil{};
     };
 
     std::shared_ptr<Profile> m_profile;

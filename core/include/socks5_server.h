@@ -3,10 +3,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -69,7 +72,27 @@ private:
         std::chrono::steady_clock::time_point lastRxLog{};
     };
 
+    struct DnsRelayState {
+        int fd = -1;
+        bool active = true;
+        std::mutex responseMutex;
+    };
+
+    struct DnsWork {
+        std::string host;
+        uint16_t port = 53;
+        std::vector<uint8_t> query;
+        std::vector<uint8_t> responseHeader;
+        sockaddr_storage clientAddr{};
+        socklen_t clientAddrLen = 0;
+        std::shared_ptr<DnsRelayState> relay;
+    };
+
     void acceptLoop();
+    bool startDnsWorkers();
+    void stopDnsWorkers();
+    void dnsWorkerLoop();
+    void processDnsWork(DnsWork work);
     void handleClient(int clientFd);
     void handleConnect(int clientFd, const Request& request);
     void handleDnsConnect(int clientFd, const Request& request);
@@ -118,6 +141,11 @@ private:
     std::thread m_acceptThread;
     std::mutex m_connectionMutex;
     std::set<int> m_connections;
+    std::mutex m_dnsMutex;
+    std::condition_variable m_dnsCondition;
+    std::deque<DnsWork> m_dnsQueue;
+    std::vector<std::thread> m_dnsWorkers;
+    bool m_stopDnsWorkers = true;
 
     std::atomic<int>  m_activeConnections{0};
     std::atomic<long> m_totalConnections{0};

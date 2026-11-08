@@ -5,6 +5,9 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
@@ -21,16 +24,24 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import com.skytr1x.obhod.diagnostics.DiagnosticReport
+import com.skytr1x.obhod.diagnostics.DiagnosticReportData
 import com.skytr1x.obhod.logging.AppLog
+import com.skytr1x.obhod.network.NetworkCalibrator
 import com.skytr1x.obhod.proxy.TelegramProxyService
 import com.skytr1x.obhod.strategy.DomainListRepository
 import com.skytr1x.obhod.strategy.StrategyProfiles
 import com.skytr1x.obhod.vpn.ZapretVpnService
+import java.io.IOException
 import java.text.DateFormat
+import java.text.SimpleDateFormat
 import java.util.Date
-import android.net.Uri
 import android.content.ActivityNotFoundException
+import android.net.Uri
+import java.util.Locale
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : AppCompatActivity() {
     private var starting by mutableStateOf(false)
@@ -40,6 +51,7 @@ class MainActivity : AppCompatActivity() {
     private var updatingDomainList by mutableStateOf(false)
     private var domainListStatus by mutableStateOf("")
     private var batteryOptimizationIgnored by mutableStateOf(false)
+    private var pendingDiagnosticReport: String? = null
 
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -54,6 +66,45 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Для системного режима нужно разрешение VPN", Toast.LENGTH_LONG).show()
         }
     }
+
+    private val diagnosticReportLauncher =
+        registerForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
+            if (uri == null) {
+                pendingDiagnosticReport = null
+            } else {
+                val report = pendingDiagnosticReport ?: createDiagnosticReport()
+                pendingDiagnosticReport = null
+                lifecycleScope.launch {
+                    try {
+                        withContext(Dispatchers.IO) {
+                            val output = contentResolver.openOutputStream(uri, "wt")
+                                ?: throw IOException("Не удалось открыть выбранный файл")
+                            output.bufferedWriter(Charsets.UTF_8).use { it.write(report) }
+                        }
+                        Toast.makeText(
+                            this@MainActivity,
+                            "Отчёт сохранён",
+                            Toast.LENGTH_LONG
+                        ).show()
+                        AppLog.i("Diagnostics", "Отчёт сохранён в выбранное пользователем место")
+                    } catch (error: IOException) {
+                        AppLog.e("Diagnostics", "Не удалось сохранить отчёт", error)
+                        Toast.makeText(
+                            this@MainActivity,
+                            "Не удалось сохранить отчёт",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    } catch (error: SecurityException) {
+                        AppLog.e("Diagnostics", "Нет доступа к выбранному файлу", error)
+                        Toast.makeText(
+                            this@MainActivity,
+                            "Нет доступа к выбранному файлу",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
+            }
+        }
 
     private val stateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -92,7 +143,8 @@ class MainActivity : AppCompatActivity() {
                     domainListStatus = domainListStatus,
                     onUpdateDomainList = ::updateDomainList,
                     batteryOptimizationIgnored = batteryOptimizationIgnored,
-                    onRequestBatteryOptimization = ::requestBatteryOptimizationExemption
+                    onRequestBatteryOptimization = ::requestBatteryOptimizationExemption,
+                    onExportDiagnosticReport = ::requestDiagnosticReport
                 )
             }
         }
@@ -195,6 +247,95 @@ class MainActivity : AppCompatActivity() {
     private fun formatTimestamp(timestamp: Long): String =
         DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
             .format(Date(timestamp))
+
+    private fun requestDiagnosticReport() {
+        val timestamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(Date())
+        pendingDiagnosticReport = createDiagnosticReport()
+        diagnosticReportLauncher.launch("obhod-diagnostics-$timestamp.txt")
+    }
+
+    private fun createDiagnosticReport(): String {
+        val connectivity = getSystemService(ConnectivityManager::class.java)
+        val network = connectivity?.let(::underlyingNetworkForReport)
+        val capabilities = network?.let(connectivity::getNetworkCapabilities)
+        val details = network?.let { NetworkCalibrator.inspectNetwork(this, it) }
+        val messages = AppLog.entries.value.map { it.message }
+        val networkStart = messages.indexOfLast { message ->
+            message.startsWith("Калибровка сети: ") ||
+                message.startsWith("Смена сетевого профиля: ")
+        }
+        val currentNetworkMessages = if (networkStart >= 0) messages.drop(networkStart) else messages
+        val calibrationSignal = messages.asReversed().firstNotNullOfOrNull { message ->
+            when {
+                message.startsWith("Калибровка сети: ") ->
+                    message.removePrefix("Калибровка сети: ").substringBefore(" (кэш)")
+                message.startsWith("Смена сетевого профиля: ") ->
+                    message.removePrefix("Смена сетевого профиля: ").substringBefore(" (кэш)")
+                else -> null
+            }
+        } ?: "неизвестно"
+        val dnsComparison = messages.asReversed()
+            .firstNotNullOfOrNull { message ->
+                message.takeIf { it.startsWith("DNS Discord/system-vs-DoH: ") }
+                    ?.removePrefix("DNS Discord/system-vs-DoH: ")
+            } ?: "неизвестно"
+        val selectedProfile = getSharedPreferences("zapret", MODE_PRIVATE)
+            .getString("selected_profile", StrategyProfiles.DEFAULT_ID)
+            ?: "неизвестно"
+        val networkClass = when {
+            capabilities == null -> "неизвестно"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "Wi-Fi"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "мобильная"
+            capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "Ethernet"
+            else -> "другая"
+        }
+        val data = DiagnosticReportData(
+            generatedAt = DateFormat.getDateTimeInstance(
+                DateFormat.SHORT,
+                DateFormat.MEDIUM,
+                Locale.ROOT
+            ).format(Date()),
+            appVersion = appVersionName(),
+            androidVersion = "${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})",
+            device = "${Build.MANUFACTURER} ${Build.MODEL}".trim().take(80),
+            networkClass = networkClass,
+            networkValidated = capabilities?.hasCapability(
+                NetworkCapabilities.NET_CAPABILITY_VALIDATED
+            ),
+            networkMetered = capabilities?.let {
+                !it.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+            },
+            privateDnsActive = details?.privateDnsActive,
+            ipv6Only = details?.ipv6Only,
+            calibrationSignal = calibrationSignal,
+            dnsComparison = dnsComparison,
+            selectedProfile = selectedProfile,
+            latestTlsSuccess = DiagnosticReport.latestTlsSuccess(currentNetworkMessages),
+            tlsSamples = DiagnosticReport.tlsSampleSummary(currentNetworkMessages),
+            latestFailure = DiagnosticReport.latestFailure(currentNetworkMessages),
+            quicSuppressionCount = DiagnosticReport.quicSuppressionCount(currentNetworkMessages)
+        )
+        return DiagnosticReport.format(data)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun underlyingNetworkForReport(connectivity: ConnectivityManager): Network? {
+        val candidates = (listOfNotNull(connectivity.activeNetwork) +
+            connectivity.allNetworks).distinct()
+        return candidates.firstOrNull { candidate ->
+            val capabilities = connectivity.getNetworkCapabilities(candidate)
+                ?: return@firstOrNull false
+            !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
+                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ||
+                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ||
+                    capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun appVersionName(): String =
+        packageManager.getPackageInfo(packageName, 0).versionName ?: "unknown"
 
     private fun isAnyServiceRunning(): Boolean =
         getSharedPreferences("telegram_proxy", MODE_PRIVATE).getBoolean("running", false) ||

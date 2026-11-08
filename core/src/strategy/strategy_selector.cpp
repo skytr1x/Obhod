@@ -530,6 +530,7 @@ void StrategySelector::markSuccess(const std::string& rawHost, const std::string
     const auto now = std::chrono::steady_clock::now();
     HostState& state = m_cache[stateKey];
     state.preferred = strategyId;
+    state.unavailableUntil = {};
     for (auto& entry : state.metrics) {
         HostState::Metric& metric = entry.second;
         metric.failures = decayedFailures(metric, now) * 0.5;
@@ -576,6 +577,27 @@ void StrategySelector::markFailure(const std::string& rawHost,
     state.updated = now;
     SKY_LOGD("StrategySelector: '%s' failed for '%s' (weight %.1f)",
              strategyId.c_str(), host.c_str(), metric.failures);
+}
+
+void StrategySelector::markHostUnavailable(const std::string& rawHost,
+                                           const std::string& scope) {
+    const std::string host = normalizeHost(rawHost);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    HostState& state = m_cache[stateKeyFor(host, scope)];
+    state.unavailableUntil = std::chrono::steady_clock::now() +
+                             std::chrono::seconds(30);
+    state.updated = std::chrono::steady_clock::now();
+}
+
+bool StrategySelector::hostUnavailableCached(const std::string& rawHost,
+                                             const std::string& scope) const {
+    const std::string host = normalizeHost(rawHost);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto it = m_cache.find(stateKeyFor(host, scope));
+    if (it == m_cache.end()) return false;
+    if (it->second.unavailableUntil > std::chrono::steady_clock::now()) return true;
+    it->second.unavailableUntil = {};
+    return false;
 }
 
 std::string StrategySelector::cachedStrategy(const std::string& rawHost,

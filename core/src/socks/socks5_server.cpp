@@ -22,6 +22,7 @@
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -54,6 +55,8 @@ constexpr int kStrategyBudgetMs = 15000;
 constexpr int kRelayIdleTimeoutMs = 120000;
 constexpr int kRelayTunnelIdleTimeoutMs = 300000;
 constexpr std::size_t kMaxFirstPayload = 32768;
+constexpr std::size_t kDnsWorkerCount = 4;
+constexpr std::size_t kMaxDnsQueueSize = 64;
 constexpr std::size_t kMaxUdpPeers = 64;
 
 std::atomic<uint64_t> g_nextTcpRequestId{1};
@@ -561,10 +564,72 @@ bool Socks5Server::start(uint16_t port, StrategySelector* selector,
         return false;
     }
 
+    if (!startDnsWorkers()) {
+        ::close(m_listenFd);
+        m_listenFd = -1;
+        return false;
+    }
+
     m_running = true;
-    m_acceptThread = std::thread(&Socks5Server::acceptLoop, this);
+    try {
+        m_acceptThread = std::thread(&Socks5Server::acceptLoop, this);
+    } catch (const std::system_error& error) {
+        m_running = false;
+        stopDnsWorkers();
+        ::close(m_listenFd);
+        m_listenFd = -1;
+        SKY_LOGE("SOCKS5: could not start accept thread: %s", error.what());
+        return false;
+    }
     SKY_LOGI("SOCKS5: listening on 127.0.0.1:%u", port);
     return true;
+}
+
+bool Socks5Server::startDnsWorkers() {
+    if (!m_dnsResolver) return true;
+    {
+        std::lock_guard<std::mutex> lock(m_dnsMutex);
+        m_stopDnsWorkers = false;
+    }
+    try {
+        for (std::size_t i = 0; i < kDnsWorkerCount; ++i) {
+            m_dnsWorkers.emplace_back(&Socks5Server::dnsWorkerLoop, this);
+        }
+    } catch (const std::system_error& error) {
+        SKY_LOGE("SOCKS5: could not start DNS worker: %s", error.what());
+        stopDnsWorkers();
+        return false;
+    }
+    return true;
+}
+
+void Socks5Server::stopDnsWorkers() {
+    {
+        std::lock_guard<std::mutex> lock(m_dnsMutex);
+        m_stopDnsWorkers = true;
+        m_dnsQueue.clear();
+    }
+    m_dnsCondition.notify_all();
+    for (auto& worker : m_dnsWorkers) {
+        if (worker.joinable()) worker.join();
+    }
+    m_dnsWorkers.clear();
+}
+
+void Socks5Server::dnsWorkerLoop() {
+    while (true) {
+        DnsWork work;
+        {
+            std::unique_lock<std::mutex> lock(m_dnsMutex);
+            m_dnsCondition.wait(lock, [this]() {
+                return m_stopDnsWorkers || !m_dnsQueue.empty();
+            });
+            if (m_stopDnsWorkers) return;
+            work = std::move(m_dnsQueue.front());
+            m_dnsQueue.pop_front();
+        }
+        processDnsWork(std::move(work));
+    }
 }
 
 void Socks5Server::trackFd(int fd) {
@@ -596,27 +661,30 @@ void Socks5Server::waitForConnections(int timeoutMs) {
 }
 
 void Socks5Server::stop() {
-    if (!m_running.exchange(false)) return;
+    const bool wasRunning = m_running.exchange(false);
 
-    if (m_listenFd >= 0) {
-        ::shutdown(m_listenFd, SHUT_RDWR);
-        ::close(m_listenFd);
-        m_listenFd = -1;
+    if (wasRunning) {
+        if (m_listenFd >= 0) {
+            ::shutdown(m_listenFd, SHUT_RDWR);
+            ::close(m_listenFd);
+            m_listenFd = -1;
+        }
+
+        if (m_acceptThread.joinable()) m_acceptThread.join();
+
+        {
+            std::lock_guard<std::mutex> lock(m_connectionMutex);
+            for (int fd : m_connections) ::shutdown(fd, SHUT_RDWR);
+        }
+        waitForConnections(5000);
+        if (m_activeConnections.load() > 0) {
+            SKY_LOGW("SOCKS5: %d connection thread(s) still active during stop",
+                     m_activeConnections.load());
+        }
     }
 
-    if (m_acceptThread.joinable()) m_acceptThread.join();
-
-    {
-        std::lock_guard<std::mutex> lock(m_connectionMutex);
-        for (int fd : m_connections) ::shutdown(fd, SHUT_RDWR);
-    }
-    waitForConnections(5000);
-    if (m_activeConnections.load() > 0) {
-        SKY_LOGW("SOCKS5: %d connection thread(s) still active during stop",
-                 m_activeConnections.load());
-    }
-
-    SKY_LOGI("SOCKS5: stopped");
+    stopDnsWorkers();
+    if (wasRunning) SKY_LOGI("SOCKS5: stopped");
 }
 
 void Socks5Server::acceptLoop() {
@@ -1083,12 +1151,23 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
 
     std::string cached;
     if (m_selector) cached = m_selector->cachedStrategy(host, strategyScope);
+    const bool hostUnavailableCached =
+        m_selector && m_selector->hostUnavailableCached(host, strategyScope);
 
     std::vector<StrategyChoice> candidates;
-    if (m_selector) {
+    if (hostUnavailableCached) {
+        cached.clear();
+        StrategyChoice direct;
+        direct.direct = true;
+        candidates.push_back(std::move(direct));
+        if (shouldLogHost("negative-tcp:" + host)) {
+            emitEvent("[TCP-PLAN] %s:%u recently unverified; using direct path during 30s cooldown",
+                      host.c_str(), request.port);
+        }
+    } else if (m_selector) {
         candidates = m_selector->candidates(host, false, strategyScope);
     }
-    if (mtprotoObfuscated && m_selector) {
+    if (!hostUnavailableCached && mtprotoObfuscated && m_selector) {
         StrategyChoice strategy = m_selector->findStrategy("mtproto-obfs-split");
         const bool explicitDirect = !candidates.empty() &&
             (candidates.front().direct ||
@@ -1238,6 +1317,7 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
             int fd = -1;
             int connectRttMs = 0;
             long elapsedMs = 0;
+            long tlsResponseMs = 0;
             sockaddr_storage address{};
             socklen_t addressLen = 0;
             std::size_t tlsHeaderBytes = 0;
@@ -1287,6 +1367,7 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
                         result.error = result.outcome.error;
                         result.failureStage = "strategy_send";
                     } else {
+                        const auto responseStart = std::chrono::steady_clock::now();
                         bool readable = false;
                         const int responseTimeoutMs = std::clamp(
                             result.connectRttMs * 3 + 250,
@@ -1303,6 +1384,10 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
                                                      remainingRaceMs),
                                             readable, result.tlsHeaderBytes,
                                             responseError)) {
+                            result.tlsResponseMs = static_cast<long>(
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() -
+                                    responseStart).count());
                             std::lock_guard<std::mutex> lock(raceMutex);
                             result.responseVerified = true;
                             if (!raceCancelled.load()) {
@@ -1391,6 +1476,9 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
                 m_selector->markSuccess(
                     host, choice.key(), winner.elapsedMs, strategyScope);
             }
+            emitEvent("[METRIC] kind=tls_success strategy=%s connect_rtt_ms=%d tls_response_ms=%ld",
+                      choice.key().c_str(), winner.connectRttMs,
+                      winner.tlsResponseMs);
             const char* action = winner.outcome.usedFake ? "fake" :
                 winner.outcome.usedDisorder ? "disorder" :
                 winner.outcome.usedTlsRec ? "tlsrec" : "split";
@@ -1524,6 +1612,7 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
             break;
         }
 
+        const auto responseStart = std::chrono::steady_clock::now();
         bool readable = false;
         std::size_t tlsHeaderBytes = 0;
         std::string responseError;
@@ -1537,6 +1626,11 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
             if (m_selector) {
                 m_selector->markSuccess(host, strategyId, ms, strategyScope);
             }
+            const long tlsResponseMs = static_cast<long>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - responseStart).count());
+            emitEvent("[METRIC] kind=tls_success strategy=%s connect_rtt_ms=%d tls_response_ms=%ld",
+                      strategyId.c_str(), connectRttMs, tlsResponseMs);
             const char* action = "split";
             if (choice.direct) {
                 action = "direct";
@@ -1593,6 +1687,10 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
                       request.port);
         }
         return;
+    }
+
+    if (!verified && completeClientHello && !directOnly && m_selector) {
+        m_selector->markHostUnavailable(host, strategyScope);
     }
 
     if (!verified && completeClientHello && !budgetExhausted && !directOnly) {
@@ -1652,6 +1750,8 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
         const std::size_t untried = candidates.size() > attemptsTried
             ? candidates.size() - attemptsTried
             : 0;
+        emitEvent("[METRIC] kind=tls_failure reason=%s",
+                  reason);
         emitEvent("[PROBLEM] type=tls_unverified host=%s port=%u remote_ip=%s attempted=%zu candidates=%zu generated=%zu untried=%zu omitted_by_cap=%zu elapsed_ms=%ld stage=%s reason=%s tls_header_bytes=%zu retry_budget=%s direct_replay=%s",
                   host.c_str(), request.port, connectedIp().c_str(),
                   attemptsTried, candidates.size(), generatedCandidateCount,
@@ -1799,101 +1899,98 @@ void Socks5Server::handleUdpAssociate(int clientFd, const Request& request) {
     closeTrackedFd(relayFd);
 }
 
-void Socks5Server::relayUdp(int clientFd, int relayFd) {
-    std::map<std::string, UdpPeer> peers;
-    struct DnsWork {
-        std::string host;
-        uint16_t port = 53;
-        std::vector<uint8_t> query;
-        std::vector<uint8_t> responseHeader;
-        sockaddr_storage clientAddr{};
-        socklen_t clientAddrLen = 0;
+void Socks5Server::processDnsWork(DnsWork work) {
+    const auto relayIsActive = [&work]() {
+        if (!work.relay) return false;
+        std::lock_guard<std::mutex> lock(work.relay->responseMutex);
+        return work.relay->active;
     };
-    std::mutex dnsMutex;
-    std::condition_variable dnsCondition;
-    std::deque<DnsWork> dnsQueue;
-    bool stopDnsWorkers = false;
-    auto dnsWorker = [this, relayFd, &dnsMutex, &dnsCondition, &dnsQueue,
-                      &stopDnsWorkers]() {
-        while (true) {
-            DnsWork work;
-            {
-                std::unique_lock<std::mutex> lock(dnsMutex);
-                dnsCondition.wait(lock, [&]() {
-                    return stopDnsWorkers || !dnsQueue.empty();
-                });
-                if (stopDnsWorkers) return;
-                work = std::move(dnsQueue.front());
-                dnsQueue.pop_front();
-            }
+    if (!relayIsActive()) return;
 
-            std::vector<uint8_t> answer = m_dnsResolver(work.query);
-            if (answer.size() < 12 || answer.size() > 65535 ||
-                (answer[2] & 0x80) == 0 ||
-                answer.size() + work.responseHeader.size() > 65507) {
-                UdpPeer fallbackPeer;
-                std::string error;
-                if (shouldLogHost("dns-doh-fallback")) {
-                    emitEvent("[PROBLEM] type=dns_doh_fallback host=dns");
-                }
-                if (createRemoteUdp(work.host, work.port, fallbackPeer, error)) {
-                    const ssize_t sent = ::sendto(
-                        fallbackPeer.fd, work.query.data(), work.query.size(),
-                        MSG_NOSIGNAL,
-                        reinterpret_cast<const struct sockaddr*>(&fallbackPeer.addr),
-                        fallbackPeer.addrLen);
-                    struct pollfd responseFd{fallbackPeer.fd, POLLIN, 0};
-                    int pollResult = 0;
-                    if (sent == static_cast<ssize_t>(work.query.size())) {
-                        do {
-                            pollResult = ::poll(&responseFd, 1, 1200);
-                        } while (pollResult < 0 && errno == EINTR);
-                    }
-                    std::vector<uint8_t> fallbackResponse(65535);
-                    const ssize_t received = pollResult > 0
-                        ? ::recv(fallbackPeer.fd, fallbackResponse.data(),
-                                 fallbackResponse.size(), MSG_DONTWAIT)
-                        : -1;
-                    if (received >= 12) {
-                        fallbackResponse.resize(static_cast<std::size_t>(received));
-                        answer = std::move(fallbackResponse);
-                    }
-                    closeTrackedFd(fallbackPeer.fd);
-                } else if (shouldLogHost("dns-system-fallback-failed")) {
-                    emitEvent("[PROBLEM] type=dns_resolution_failed host=dns reason=resolver_unavailable detail=%s",
-                              error.c_str());
+    std::vector<uint8_t> answer = m_dnsResolver(work.query);
+    if (answer.size() < 12 || answer.size() > 65535 ||
+        answer[0] != work.query[0] || answer[1] != work.query[1] ||
+        (answer[2] & 0x80) == 0 ||
+        answer.size() + work.responseHeader.size() > 65507) {
+        if (!relayIsActive()) return;
+        UdpPeer fallbackPeer;
+        std::string error;
+        if (shouldLogHost("dns-doh-fallback")) {
+            emitEvent("[PROBLEM] type=dns_doh_fallback host=dns");
+        }
+        if (createRemoteUdp(work.host, work.port, fallbackPeer, error)) {
+            const ssize_t sent = ::sendto(
+                fallbackPeer.fd, work.query.data(), work.query.size(),
+                MSG_NOSIGNAL,
+                reinterpret_cast<const struct sockaddr*>(&fallbackPeer.addr),
+                fallbackPeer.addrLen);
+            struct pollfd responseFd{fallbackPeer.fd, POLLIN, 0};
+            int pollResult = 0;
+            if (sent == static_cast<ssize_t>(work.query.size())) {
+                do {
+                    pollResult = ::poll(&responseFd, 1, 1200);
+                } while (pollResult < 0 && errno == EINTR);
+            }
+            std::vector<uint8_t> fallbackResponse(65535);
+            const ssize_t received = pollResult > 0
+                ? ::recv(fallbackPeer.fd, fallbackResponse.data(),
+                         fallbackResponse.size(), MSG_DONTWAIT)
+                : -1;
+            if (received >= 12) {
+                fallbackResponse.resize(static_cast<std::size_t>(received));
+                if (fallbackResponse[0] == work.query[0] &&
+                    fallbackResponse[1] == work.query[1] &&
+                    (fallbackResponse[2] & 0x80) != 0) {
+                    answer = std::move(fallbackResponse);
                 }
             }
+            closeTrackedFd(fallbackPeer.fd);
+        } else if (shouldLogHost("dns-system-fallback-failed")) {
+            emitEvent("[PROBLEM] type=dns_resolution_failed host=dns reason=resolver_unavailable detail=%s",
+                      error.c_str());
+        }
+    }
 
-            if (answer.size() < 12 || answer.size() > 65535 ||
-                (answer[2] & 0x80) == 0 ||
-                answer.size() + work.responseHeader.size() > 65507) {
-                if (shouldLogHost("dns-system-fallback-failed")) {
-                    emitEvent("[PROBLEM] type=dns_resolution_failed host=dns reason=all_resolvers_failed");
-                }
-                continue;
-            }
-            std::vector<uint8_t> response = std::move(work.responseHeader);
-            response.insert(response.end(), answer.begin(), answer.end());
-            const ssize_t relayed = ::sendto(
-                relayFd, response.data(), response.size(), MSG_NOSIGNAL,
+    if (answer.size() < 12 || answer.size() > 65535 ||
+        answer[0] != work.query[0] || answer[1] != work.query[1] ||
+        (answer[2] & 0x80) == 0 ||
+        answer.size() + work.responseHeader.size() > 65507) {
+        if (!relayIsActive()) return;
+        if (shouldLogHost("dns-system-fallback-failed")) {
+            emitEvent("[PROBLEM] type=dns_resolution_failed host=dns reason=all_resolvers_failed");
+        }
+        return;
+    }
+
+    std::vector<uint8_t> response = std::move(work.responseHeader);
+    response.insert(response.end(), answer.begin(), answer.end());
+    ssize_t relayed = -1;
+    bool relayActive = false;
+    if (work.relay) {
+        std::lock_guard<std::mutex> lock(work.relay->responseMutex);
+        relayActive = work.relay->active;
+        if (relayActive && work.relay->fd >= 0) {
+            relayed = ::sendto(
+                work.relay->fd, response.data(), response.size(), MSG_NOSIGNAL,
                 reinterpret_cast<const struct sockaddr*>(&work.clientAddr),
                 work.clientAddrLen);
-            if (relayed == static_cast<ssize_t>(response.size())) {
-                m_bytesOut.fetch_add(static_cast<long>(answer.size()));
-                if (shouldLogHost("dns-doh")) {
-                    emitEvent("[DNS] UDP response returned");
-                }
-            } else if (shouldLogHost("dns-response-send-failed")) {
-                emitEvent("[DNS-FAIL] could not return DNS UDP response: %s",
-                          std::strerror(errno));
-            }
         }
-    };
-    std::vector<std::thread> dnsThreads;
-    if (m_dnsResolver) {
-        dnsThreads.emplace_back(dnsWorker);
     }
+    if (relayed == static_cast<ssize_t>(response.size())) {
+        m_bytesOut.fetch_add(static_cast<long>(answer.size()));
+        if (shouldLogHost("dns-doh")) {
+            emitEvent("[DNS] UDP response returned");
+        }
+    } else if (relayActive && shouldLogHost("dns-response-send-failed")) {
+        emitEvent("[DNS-FAIL] could not return DNS UDP response: %s",
+                  std::strerror(errno));
+    }
+}
+
+void Socks5Server::relayUdp(int clientFd, int relayFd) {
+    std::map<std::string, UdpPeer> peers;
+    auto dnsRelay = std::make_shared<DnsRelayState>();
+    dnsRelay->fd = relayFd;
     sockaddr_storage clientAddr{};
     socklen_t clientAddrLen = 0;
     uint64_t totalSentPackets = 0;
@@ -1991,21 +2088,32 @@ void Socks5Server::relayUdp(int clientFd, int relayFd) {
 
                             if (port == 53 && m_dnsResolver && payloadLen >= 12 &&
                                 payloadLen <= 4096 && (payload[2] & 0x80) == 0) {
-                                std::lock_guard<std::mutex> lock(dnsMutex);
-                                if (dnsQueue.size() < 64) {
-                                    DnsWork work;
-                                    work.host = host;
-                                    work.port = port;
-                                    work.query.assign(payload, payload + payloadLen);
-                                    work.responseHeader = {0, 0, 0};
-                                    work.responseHeader.insert(
-                                        work.responseHeader.end(), data + 3,
-                                        data + offset);
-                                    work.clientAddr = clientAddr;
-                                    work.clientAddrLen = clientAddrLen;
-                                    dnsQueue.push_back(std::move(work));
-                                    dnsCondition.notify_one();
+                                bool queued = false;
+                                {
+                                    std::lock_guard<std::mutex> lock(m_dnsMutex);
+                                    if (!m_stopDnsWorkers &&
+                                        m_dnsQueue.size() < kMaxDnsQueueSize) {
+                                        DnsWork work;
+                                        work.host = host;
+                                        work.port = port;
+                                        work.query.assign(payload, payload + payloadLen);
+                                        work.responseHeader = {0, 0, 0};
+                                        work.responseHeader.insert(
+                                            work.responseHeader.end(), data + 3,
+                                            data + offset);
+                                        work.clientAddr = clientAddr;
+                                        work.clientAddrLen = clientAddrLen;
+                                        work.relay = dnsRelay;
+                                        m_dnsQueue.push_back(std::move(work));
+                                        queued = true;
+                                    }
+                                }
+                                if (queued) {
+                                    m_dnsCondition.notify_one();
                                     continue;
+                                }
+                                if (shouldLogHost("dns-worker-queue-full")) {
+                                    emitEvent("[PROBLEM] type=dns_worker_queue_full host=dns reason=queue_full");
                                 }
                             }
 
@@ -2199,13 +2307,8 @@ void Socks5Server::relayUdp(int clientFd, int relayFd) {
         closeTrackedFd(entry.second.fd);
     }
     {
-        std::lock_guard<std::mutex> lock(dnsMutex);
-        stopDnsWorkers = true;
-        dnsQueue.clear();
-    }
-    dnsCondition.notify_all();
-    for (auto& thread : dnsThreads) {
-        if (thread.joinable()) thread.join();
+        std::lock_guard<std::mutex> lock(dnsRelay->responseMutex);
+        dnsRelay->active = false;
     }
     emitEvent("[UDP-ASSOCIATE] stopped peers=%zu tx_packets=%llu tx_bytes=%llu rx_packets=%llu rx_bytes=%llu",
               peers.size(), static_cast<unsigned long long>(totalSentPackets),

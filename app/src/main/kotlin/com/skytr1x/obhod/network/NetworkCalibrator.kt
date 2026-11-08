@@ -1,10 +1,15 @@
 package com.skytr1x.obhod.network
 
 import android.content.Context
+import android.net.ConnectivityManager
 import android.net.Network
 import android.net.VpnService
+import android.os.Build
 import java.io.EOFException
 import java.io.IOException
+import java.net.Inet4Address
+import java.net.Inet6Address
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketException
@@ -16,6 +21,7 @@ import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLException
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocket
+import javax.net.ssl.SNIHostName
 
 internal object NetworkCalibrator {
     enum class Signal(val storageValue: String) {
@@ -32,12 +38,24 @@ internal object NetworkCalibrator {
     data class Result(
         val signal: Signal,
         val fromCache: Boolean,
-        val dnsComparison: DnsComparison
+        val dnsComparison: DnsComparison,
+        val networkDetails: NetworkDetails
     )
+
+    data class NetworkDetails(
+        val privateDnsActive: Boolean?,
+        val hasIpv4DefaultRoute: Boolean?,
+        val hasIpv6DefaultRoute: Boolean?
+    ) {
+        val ipv6Only: Boolean?
+            get() = if (hasIpv4DefaultRoute == null || hasIpv6DefaultRoute == null) null
+            else hasIpv6DefaultRoute && !hasIpv4DefaultRoute
+    }
 
     enum class DnsComparison(val storageValue: String) {
         MATCH("match"),
-        ANSWER_MISMATCH("answer_mismatch"),
+        ANSWERS_DIFFER_TLS_OK("answers_differ_tls_ok"),
+        ANSWERS_DIFFER_TLS_FAILED("answers_differ_tls_failed"),
         SYSTEM_FAILED("system_failed"),
         DOH_FAILED("doh_failed"),
         UNKNOWN("unknown");
@@ -75,10 +93,12 @@ internal object NetworkCalibrator {
             return Result(
                 Signal.UNKNOWN,
                 fromCache = false,
-                dnsComparison = DnsComparison.UNKNOWN
+                dnsComparison = DnsComparison.UNKNOWN,
+                networkDetails = NetworkDetails(null, null, null)
             )
         }
 
+        val networkDetails = inspectNetwork(context, network)
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val cacheKey = sha256(networkKey)
         val timestampKey = "${cacheKey}_at"
@@ -92,7 +112,8 @@ internal object NetworkCalibrator {
             return Result(
                 Signal.fromStorage(prefs.getString(signalKey, null)),
                 fromCache = true,
-                dnsComparison = comparison
+                dnsComparison = comparison,
+                networkDetails = networkDetails
             )
         }
 
@@ -105,7 +126,30 @@ internal object NetworkCalibrator {
         return Result(
             calibration.signal,
             fromCache = false,
-            dnsComparison = calibration.dnsComparison
+            dnsComparison = calibration.dnsComparison,
+            networkDetails = networkDetails
+        )
+    }
+
+    internal fun inspectNetwork(context: Context, network: Network): NetworkDetails {
+        val connectivityManager =
+            context.getSystemService(ConnectivityManager::class.java)
+                ?: return NetworkDetails(null, null, null)
+        val linkProperties = connectivityManager.getLinkProperties(network)
+            ?: return NetworkDetails(null, null, null)
+        val routes = linkProperties.routes
+        return NetworkDetails(
+            privateDnsActive = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                linkProperties.isPrivateDnsActive
+            } else {
+                null
+            },
+            hasIpv4DefaultRoute = routes.any {
+                it.destination.address is Inet4Address && it.destination.prefixLength == 0
+            },
+            hasIpv6DefaultRoute = routes.any {
+                it.destination.address is Inet6Address && it.destination.prefixLength == 0
+            }
         )
     }
 
@@ -155,13 +199,14 @@ internal object NetworkCalibrator {
     private fun compareDns(context: Context, network: Network): DnsComparison {
         val query = DnsOverHttpsResolver.createAQuery(DNS_CONTROL_HOST)
             ?: return DnsComparison.UNKNOWN
-        val systemAddresses = try {
-            network.getAllByName(DNS_CONTROL_HOST)
-                .mapNotNull { it.hostAddress }
-                .toSet()
+        val systemAddressList = try {
+            network.getAllByName(DNS_CONTROL_HOST).toList()
         } catch (_: IOException) {
-            emptySet()
+            emptyList()
         }
+        val systemAddresses = systemAddressList.map {
+            it.hostAddress.orEmpty().substringBefore('%').lowercase()
+        }.toSet()
         val vpnService = context as? VpnService
         val dohResponse = DnsOverHttpsResolver.resolve(query, network) { socket ->
             vpnService?.protect(socket) ?: true
@@ -170,13 +215,39 @@ internal object NetworkCalibrator {
         } else {
             DnsComparison.DOH_FAILED
         }
-        val dohAddresses = DnsOverHttpsResolver.ipv4Answers(dohResponse)
+        val dohAddresses = DnsOverHttpsResolver.ipAnswers(dohResponse)
         if (dohAddresses.isEmpty()) return DnsComparison.UNKNOWN
         return when {
             systemAddresses.isEmpty() -> DnsComparison.SYSTEM_FAILED
-            systemAddresses.intersect(dohAddresses).isEmpty() ->
-                DnsComparison.ANSWER_MISMATCH
-            else -> DnsComparison.MATCH
+            systemAddresses.intersect(dohAddresses).isNotEmpty() -> DnsComparison.MATCH
+            systemAddressList.take(2).any { address ->
+                probeTlsAddress(network, DNS_CONTROL_HOST, address)
+            } -> DnsComparison.ANSWERS_DIFFER_TLS_OK
+            else -> DnsComparison.ANSWERS_DIFFER_TLS_FAILED
+        }
+    }
+
+    private fun probeTlsAddress(network: Network, host: String, address: InetAddress): Boolean {
+        val rawSocket = Socket()
+        return try {
+            network.bindSocket(rawSocket)
+            rawSocket.connect(InetSocketAddress(address, 443), CONNECT_TIMEOUT_MS)
+            rawSocket.soTimeout = HANDSHAKE_TIMEOUT_MS
+            val tlsSocket = SSLContext.getDefault().socketFactory
+                .createSocket(rawSocket, host, 443, true) as SSLSocket
+            tlsSocket.use {
+                val parameters = it.sslParameters
+                parameters.endpointIdentificationAlgorithm = "HTTPS"
+                parameters.serverNames = listOf(SNIHostName(host))
+                it.sslParameters = parameters
+                it.soTimeout = HANDSHAKE_TIMEOUT_MS
+                it.startHandshake()
+            }
+            true
+        } catch (_: Exception) {
+            false
+        } finally {
+            runCatching { rawSocket.close() }
         }
     }
 
@@ -203,6 +274,10 @@ internal object NetworkCalibrator {
             val tlsSocket = SSLContext.getDefault().socketFactory
                 .createSocket(rawSocket, host, 443, true) as SSLSocket
             tlsSocket.use {
+                val parameters = it.sslParameters
+                parameters.endpointIdentificationAlgorithm = "HTTPS"
+                parameters.serverNames = listOf(SNIHostName(host))
+                it.sslParameters = parameters
                 it.soTimeout = HANDSHAKE_TIMEOUT_MS
                 it.startHandshake()
             }

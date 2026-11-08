@@ -117,7 +117,8 @@ fun ObhodApp(
     domainListStatus: String,
     onUpdateDomainList: () -> Unit,
     batteryOptimizationIgnored: Boolean,
-    onRequestBatteryOptimization: () -> Unit
+    onRequestBatteryOptimization: () -> Unit,
+    onExportDiagnosticReport: () -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -173,7 +174,10 @@ fun ObhodApp(
                         onCopyText = copyText
                     )
 
-                    ObhodTab.Logs -> LogsScreen(onCopyText = copyText)
+                    ObhodTab.Logs -> LogsScreen(
+                        onCopyText = copyText,
+                        onExportDiagnosticReport = onExportDiagnosticReport
+                    )
                     ObhodTab.Source -> SourceScreen()
                 }
             }
@@ -700,9 +704,13 @@ private fun StrategySelector(
 
 // logs
 @Composable
-private fun LogsScreen(onCopyText: (String) -> Unit) {
+private fun LogsScreen(
+    onCopyText: (String) -> Unit,
+    onExportDiagnosticReport: () -> Unit
+) {
     val entries by AppLog.entries.collectAsState()
     val newestFirst = entries.asReversed()
+    var confirmDiagnosticExport by rememberSaveable { mutableStateOf(false) }
     Column(
         Modifier
             .fillMaxSize()
@@ -742,6 +750,19 @@ private fun LogsScreen(onCopyText: (String) -> Unit) {
                 )
             }
         }
+        Spacer(Modifier.height(12.dp))
+        OutlinedButton(
+            onClick = { confirmDiagnosticExport = true },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Сохранить диагностический отчёт")
+        }
+        Text(
+            text = "Отчёт не отправляется автоматически",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 4.dp)
+        )
         Spacer(Modifier.height(20.dp))
         if (entries.isEmpty()) {
             EmptyLogs()
@@ -757,6 +778,35 @@ private fun LogsScreen(onCopyText: (String) -> Unit) {
                     LogCard(entry = entry, onClick = { onCopyText(entry.asLine()) })
                 }
             }
+        }
+        if (confirmDiagnosticExport) {
+            AlertDialog(
+                onDismissRequest = { confirmDiagnosticExport = false },
+                title = { Text("Сохранить отчёт?") },
+                text = {
+                    Text(
+                        "В отчёт войдут версия приложения и устройства, тип сети, результаты " +
+                            "калибровки и последние обезличенные метрики. Домены, IP-адреса, SSID " +
+                            "и содержимое трафика не включаются. Ничего не отправляется; выберите " +
+                            "место, куда сохранить файл."
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            confirmDiagnosticExport = false
+                            onExportDiagnosticReport()
+                        }
+                    ) {
+                        Text("Выбрать место")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { confirmDiagnosticExport = false }) {
+                        Text("Отмена")
+                    }
+                }
+            )
         }
     }
 }

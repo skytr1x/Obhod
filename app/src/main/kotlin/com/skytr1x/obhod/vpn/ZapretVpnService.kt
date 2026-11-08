@@ -15,6 +15,7 @@ import com.skytr1x.obhod.bridge.NativeBridge
 import com.skytr1x.obhod.logging.AppLog
 import com.skytr1x.obhod.network.DnsOverHttpsResolver
 import com.skytr1x.obhod.network.NetworkCalibrator
+import com.skytr1x.obhod.diagnostics.ConnectionFailureClassifier
 import com.skytr1x.obhod.notification.ObhodNotifications
 import com.skytr1x.obhod.proxy.TelegramProxyService
 import com.skytr1x.obhod.strategy.DomainListRepository
@@ -145,6 +146,7 @@ class ZapretVpnService : VpnService(), NativeBridge.Protector, NativeBridge.List
                     if (calibration.fromCache) " (кэш)" else ""
             )
             AppLog.i(TAG, "DNS Discord/system-vs-DoH: ${calibration.dnsComparison.storageValue}")
+            logNetworkDetails(calibration.networkDetails)
             AppLog.i(
                 TAG,
                 if (tcpOrder.isBlank()) {
@@ -265,6 +267,9 @@ misc:
 
     override fun onEvent(message: String) {
         AppLog.d(TAG, message)
+        ConnectionFailureClassifier.fromLogMessage(message)?.let { finding ->
+            AppLog.i(TAG, "Диагностика ${finding.code}: ${finding.summary}")
+        }
         if (!message.startsWith("[PROBLEM]")) return
 
         val fields = message.substringAfter("[PROBLEM]").trim()
@@ -288,6 +293,8 @@ misc:
         val warning = when (type) {
             "dns_doh_fallback" ->
                 "DNS: DoH-провайдеры недоступны, запрос передан системному DNS."
+            "dns_worker_queue_full" ->
+                "DNS: очередь DoH перегружена, запрос передан системному DNS."
             "dns_resolution_failed" ->
                 "DNS: не удалось получить ответ ни через DoH, ни через системный DNS."
             "tcp_connect_failed" -> {
@@ -420,6 +427,13 @@ misc:
             .getOrDefault("")
     }
 
+    private fun logNetworkDetails(details: NetworkCalibrator.NetworkDetails) {
+        val privateDns = details.privateDnsActive?.let { if (it) "active" else "inactive" }
+            ?: "unknown"
+        val ipv6Only = details.ipv6Only?.let { if (it) "yes" else "no" } ?: "unknown"
+        AppLog.i(TAG, "Network diagnostics: Private DNS=$privateDns, IPv6-only=$ipv6Only")
+    }
+
     private fun hasUnderlyingIpv6Route(): Boolean {
         val network = underlyingNetwork() ?: return false
         val link = connectivity.getLinkProperties(network) ?: return false
@@ -521,6 +535,7 @@ misc:
                 if (calibration.fromCache) " (кэш)" else ""
         )
         AppLog.i(TAG, "DNS Discord/system-vs-DoH: ${calibration.dnsComparison.storageValue}")
+        logNetworkDetails(calibration.networkDetails)
         AppLog.i(
             TAG,
             if (tcpOrder.isBlank()) {
