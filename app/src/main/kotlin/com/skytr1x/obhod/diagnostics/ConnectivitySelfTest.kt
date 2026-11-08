@@ -1,7 +1,12 @@
 package com.skytr1x.obhod.diagnostics
 
+import android.net.Network
+import com.skytr1x.obhod.network.DnsOverHttpsResolver
 import java.io.BufferedInputStream
 import java.io.IOException
+import java.net.Inet4Address
+import java.net.Inet6Address
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
@@ -37,30 +42,76 @@ internal data class TransferTestConfig(
 
 internal data class TransferTestResult(
     val service: String,
+    val attempt: Int,
     val outcome: String,
     val bytesReceived: Int,
     val elapsedMs: Long,
+    val dohResolveMs: Long?,
     val socksConnectMs: Long?,
     val tlsHandshakeMs: Long?,
     val transferMs: Long?,
     val httpStatus: Int?
 ) {
     fun asLogMessage(): String =
-        "[SELFTEST] service=$service outcome=$outcome bytes=$bytesReceived " +
+        "[SELFTEST] service=$service attempt=$attempt outcome=$outcome bytes=$bytesReceived " +
             "elapsed_ms=$elapsedMs socks_ms=${socksConnectMs ?: "-"} " +
+            "doh_ms=${dohResolveMs ?: "-"} " +
             "tls_ms=${tlsHandshakeMs ?: "-"} transfer_ms=${transferMs ?: "-"} " +
             "http=${httpStatus ?: "-"}"
 }
 
+internal data class TransferServiceStats(
+    val service: String,
+    val httpResponsesReceived: Int,
+    val attempts: Int,
+    val medianElapsedMs: Long?,
+    val medianBytesReceived: Int?,
+    val medianTransferKiBPerSecond: Double?
+)
+
 internal data class TransferTestSummary(
     val config: TransferTestConfig,
+    val repetitions: Int,
     val results: List<TransferTestResult>
-)
+) {
+    fun serviceStats(): List<TransferServiceStats> =
+        results.groupBy { it.service }.map { (service, attempts) ->
+            val transferRates = attempts.mapNotNull { result ->
+                val transferMs = result.transferMs?.takeIf { it > 0 } ?: return@mapNotNull null
+                result.bytesReceived * 1000.0 / 1024.0 / transferMs
+            }
+            TransferServiceStats(
+                service = service,
+                httpResponsesReceived = attempts.count { it.httpStatus != null },
+                attempts = attempts.size,
+                medianElapsedMs = median(attempts.map { it.elapsedMs }),
+                medianBytesReceived = median(attempts.map { it.bytesReceived.toLong() })?.toInt(),
+                medianTransferKiBPerSecond = median(transferRates)
+            )
+        }
+
+    private fun median(values: List<Long>): Long? {
+        val sorted = values.sorted()
+        if (sorted.isEmpty()) return null
+        val middle = sorted.size / 2
+        return if (sorted.size % 2 == 1) sorted[middle]
+        else (sorted[middle - 1] + sorted[middle]) / 2
+    }
+
+    private fun median(values: List<Double>): Double? {
+        val sorted = values.sorted()
+        if (sorted.isEmpty()) return null
+        val middle = sorted.size / 2
+        return if (sorted.size % 2 == 1) sorted[middle]
+        else (sorted[middle - 1] + sorted[middle]) / 2.0
+    }
+}
 
 internal object ConnectivitySelfTest {
     private const val SOCKS_PORT = 10800
     private const val MAX_HTTP_LINE_BYTES = 8192
     private const val MAX_HTTP_HEADER_BYTES = 65536
+    const val REPETITIONS = 3
 
     private data class Target(
         val service: String,
@@ -78,9 +129,9 @@ internal object ConnectivitySelfTest {
     private class SelfTestFailure(val outcome: String) : IOException()
 
     private val targets = listOf(
-        Target("youtube", "www.youtube.com") { "/" },
-        Target("discord", "discord.com") { "/" },
-        Target("4pda", "4pda.to") { "/forum/index.php" },
+        Target("youtube", "i.ytimg.com") { "/vi/aqz-KE-bpKQ/maxresdefault.jpg" },
+        Target("discord", "cdn.discordapp.com") { "/embed/avatars/0.png" },
+        Target("4pda", "4pda.to") { "/favicon.ico" },
         Target("cloudflare", "speed.cloudflare.com") { bytes ->
             "/__down?bytes=$bytes"
         }
@@ -88,25 +139,105 @@ internal object ConnectivitySelfTest {
 
     fun run(
         config: TransferTestConfig,
-        onProgress: (service: String) -> Unit,
+        network: Network?,
+        onProgress: (service: String, attempt: Int) -> Unit,
         onResult: (TransferTestResult) -> Unit
     ): TransferTestSummary {
-        val results = targets.map { target ->
-            onProgress(target.service)
-            measure(target, config).also(onResult)
+        val results = buildList {
+            for (attempt in 1..REPETITIONS) {
+                targets.forEach { target ->
+                    ensureNotInterrupted()
+                    onProgress(target.service, attempt)
+                    measure(target, config, network, attempt).also {
+                        add(it)
+                        onResult(it)
+                    }
+                }
+            }
         }
-        return TransferTestSummary(config, results)
+        return TransferTestSummary(config, REPETITIONS, results)
     }
 
-    private fun measure(target: Target, config: TransferTestConfig): TransferTestResult {
+    private fun resolveAddresses(host: String, network: Network): List<InetAddress> {
+        val queries = listOfNotNull(
+            DnsOverHttpsResolver.createAQuery(host),
+            DnsOverHttpsResolver.createAaaaQuery(host)
+        )
+        return queries.flatMap { query ->
+            ensureNotInterrupted()
+            // The resolver binds its DoH socket to this physical network before this callback.
+            val response = DnsOverHttpsResolver.resolve(query, network) { true }
+                ?: return@flatMap emptyList()
+            ensureNotInterrupted()
+            DnsOverHttpsResolver.ipAnswers(response).mapNotNull(::parseNumericAddress)
+        }.distinct()
+    }
+
+    private fun ensureNotInterrupted() {
+        if (Thread.currentThread().isInterrupted) {
+            throw InterruptedException("Self-test cancelled")
+        }
+    }
+
+    private fun parseNumericAddress(value: String): InetAddress? {
+        if (value.contains(':')) {
+            if (!value.matches(Regex("[0-9a-fA-F:]+"))) return null
+            return try {
+                InetAddress.getByName(value).takeIf { it is Inet6Address }
+            } catch (_: IOException) {
+                null
+            }
+        }
+        val octets = value.split('.').map { it.toIntOrNull() ?: return null }
+        if (octets.size != 4 || octets.any { it !in 0..255 }) return null
+        return InetAddress.getByAddress(octets.map(Int::toByte).toByteArray())
+            .takeIf { it is Inet4Address }
+    }
+
+    internal fun socksConnectRequest(address: InetAddress, port: Int): ByteArray {
+        require(port in 1..65535)
+        val addressType = when (address) {
+            is Inet4Address -> 1
+            is Inet6Address -> 4
+            else -> throw IllegalArgumentException("Unsupported IP address family")
+        }
+        return byteArrayOf(5, 1, 0, addressType.toByte()) +
+            address.address +
+            byteArrayOf((port ushr 8).toByte(), port.toByte())
+    }
+
+    private fun measure(
+        target: Target,
+        config: TransferTestConfig,
+        network: Network?,
+        attempt: Int
+    ): TransferTestResult {
         val startedAtNanos = System.nanoTime()
-        val activeSocket = AtomicReference<Socket?>()
-        val phase = AtomicReference(Phase.SOCKS)
+        val addresses = network?.let { resolveAddresses(target.host, it) }.orEmpty()
+        val dohResolveMs = elapsedMs(startedAtNanos)
+        val address = addresses.getOrNull((attempt - 1) % addresses.size.coerceAtLeast(1))
         val bytesReceived = AtomicInteger()
         val socksConnectMs = AtomicLong(-1)
         val tlsHandshakeMs = AtomicLong(-1)
         val transferMs = AtomicLong(-1)
         val httpStatus = AtomicInteger(-1)
+        if (address == null) {
+            return result(
+                target,
+                attempt,
+                if (network == null) "network_unavailable" else "dns_failed",
+                startedAtNanos,
+                dohResolveMs,
+                bytesReceived,
+                socksConnectMs,
+                tlsHandshakeMs,
+                transferMs,
+                httpStatus
+            )
+        }
+
+        val activeSocket = AtomicReference<Socket?>()
+        val phase = AtomicReference(Phase.SOCKS)
         val executor = Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "obhod-transfer-test").apply { isDaemon = true }
         }
@@ -114,7 +245,10 @@ internal object ConnectivitySelfTest {
             try {
                 transfer(
                     target,
+                    address,
+                    attempt,
                     config,
+                    dohResolveMs,
                     startedAtNanos,
                     activeSocket,
                     phase,
@@ -127,9 +261,10 @@ internal object ConnectivitySelfTest {
             } catch (error: SelfTestFailure) {
                 result(
                     target,
+                    attempt,
                     error.outcome,
-                    config,
                     startedAtNanos,
+                    dohResolveMs,
                     bytesReceived,
                     socksConnectMs,
                     tlsHandshakeMs,
@@ -139,14 +274,15 @@ internal object ConnectivitySelfTest {
             } catch (_: SocketTimeoutException) {
                 result(
                     target,
+                    attempt,
                     when (phase.get()) {
                         Phase.SOCKS -> "connect_timeout"
                         Phase.TLS -> "tls_timeout"
                         Phase.HTTP_HEADERS -> "response_timeout"
                         Phase.BODY -> "idle_timeout"
                     },
-                    config,
                     startedAtNanos,
+                    dohResolveMs,
                     bytesReceived,
                     socksConnectMs,
                     tlsHandshakeMs,
@@ -156,14 +292,15 @@ internal object ConnectivitySelfTest {
             } catch (_: IOException) {
                 result(
                     target,
+                    attempt,
                     when (phase.get()) {
                         Phase.SOCKS -> "proxy_unavailable"
                         Phase.TLS -> "tls_failed"
                         Phase.HTTP_HEADERS -> "http_response_failed"
                         Phase.BODY -> "transfer_failed"
                     },
-                    config,
                     startedAtNanos,
+                    dohResolveMs,
                     bytesReceived,
                     socksConnectMs,
                     tlsHandshakeMs,
@@ -174,15 +311,19 @@ internal object ConnectivitySelfTest {
         }
 
         return try {
-            future.get(config.hostTimeoutSeconds.toLong(), TimeUnit.SECONDS)
+            future.get(
+                (config.hostTimeoutSeconds * 1000L - elapsedMs(startedAtNanos)).coerceAtLeast(1),
+                TimeUnit.MILLISECONDS
+            )
         } catch (_: TimeoutException) {
             activeSocket.getAndSet(null)?.let { runCatching { it.close() } }
             future.cancel(true)
             result(
                 target,
+                attempt,
                 "overall_timeout",
-                config,
                 startedAtNanos,
+                dohResolveMs,
                 bytesReceived,
                 socksConnectMs,
                 tlsHandshakeMs,
@@ -205,7 +346,10 @@ internal object ConnectivitySelfTest {
 
     private fun transfer(
         target: Target,
+        address: InetAddress,
+        attempt: Int,
         config: TransferTestConfig,
+        dohResolveMs: Long,
         startedAtNanos: Long,
         activeSocket: AtomicReference<Socket?>,
         phase: AtomicReference<Phase>,
@@ -218,10 +362,13 @@ internal object ConnectivitySelfTest {
         val socket = Socket()
         activeSocket.set(socket)
         try {
+            val socksStartedAtNanos = System.nanoTime()
+            val remainingMs = config.hostTimeoutSeconds * 1000L - elapsedMs(startedAtNanos)
+            if (remainingMs <= 0) throw SelfTestFailure("overall_timeout")
             socket.tcpNoDelay = true
             socket.connect(
                 InetSocketAddress("127.0.0.1", SOCKS_PORT),
-                minOf(config.hostTimeoutSeconds * 1000, 5000)
+                minOf(remainingMs.toInt(), 5000)
             )
             socket.soTimeout = config.idleTimeoutSeconds * 1000
             val input = BufferedInputStream(socket.getInputStream())
@@ -234,13 +381,8 @@ internal object ConnectivitySelfTest {
                 throw SelfTestFailure("socks_auth_unsupported")
             }
 
-            val hostBytes = target.host.toByteArray(StandardCharsets.US_ASCII)
             val port = 443
-            output.write(byteArrayOf(
-                5, 1, 0, 3, hostBytes.size.toByte()
-            ))
-            output.write(hostBytes)
-            output.write(byteArrayOf((port ushr 8).toByte(), port.toByte()))
+            output.write(socksConnectRequest(address, port))
             output.flush()
             val reply = readExact(input, socket, config, startedAtNanos, 4)
             if (reply[0] != 5.toByte()) throw SelfTestFailure("invalid_socks_reply")
@@ -252,7 +394,9 @@ internal object ConnectivitySelfTest {
                 else -> throw SelfTestFailure("invalid_socks_reply")
             }
             readExact(input, socket, config, startedAtNanos, boundAddressLength + 2)
-            socksConnectMs.set(elapsedMs(startedAtNanos))
+            socksConnectMs.set(
+                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - socksStartedAtNanos)
+            )
 
             phase.set(Phase.TLS)
             val tlsStarted = System.nanoTime()
@@ -276,6 +420,7 @@ internal object ConnectivitySelfTest {
                 ?: throw SelfTestFailure("empty_http_response")
             val statusCode = statusLine.split(' ').getOrNull(1)?.toIntOrNull()
                 ?: throw SelfTestFailure("invalid_http_response")
+            if (statusCode !in 100..599) throw SelfTestFailure("invalid_http_response")
             httpStatus.set(statusCode)
 
             var contentLength: Long? = null
@@ -308,21 +453,9 @@ internal object ConnectivitySelfTest {
                 }
             }
 
-            if (statusCode !in 200..299) return result(
-                target,
-                "http_status",
-                config,
-                startedAtNanos,
-                bytesReceived,
-                socksConnectMs,
-                tlsHandshakeMs,
-                transferMs,
-                httpStatus
-            )
-
             phase.set(Phase.BODY)
             transferMs.set(0)
-            val outcome = when {
+            val bodyOutcome = when {
                 chunked -> readChunkedBody(
                     reader, tlsSocket, config, startedAtNanos, bytesReceived, transferMs
                 )
@@ -338,9 +471,10 @@ internal object ConnectivitySelfTest {
             }
             return result(
                 target,
-                outcome,
-                config,
+                attempt,
+                if (statusCode !in 200..299) "reached_http_non_2xx" else bodyOutcome,
                 startedAtNanos,
+                dohResolveMs,
                 bytesReceived,
                 socksConnectMs,
                 tlsHandshakeMs,
@@ -395,7 +529,9 @@ internal object ConnectivitySelfTest {
                     if (contentBytesLeft == 0) -1
                     else input.read(buffer, 0, minOf(requested, contentBytesLeft))
                 }
-                if (count < 0) return "short_response"
+                if (count < 0) {
+                    return if (bytesReceived.get() > 0) "response_complete" else "empty_body"
+                }
                 bytesReceived.addAndGet(count)
                 if (remainingContent != null) remainingContent -= count
             }
@@ -428,7 +564,7 @@ internal object ConnectivitySelfTest {
                     while (readHttpLine(input, socket, config, startedAtNanos)?.isNotEmpty() == true) {
                         Unit
                     }
-                    return "short_response"
+                    return if (bytesReceived.get() > 0) "response_complete" else "empty_body"
                 }
                 var chunkRemaining = chunkSize
                 while (chunkRemaining > 0 && bytesReceived.get() < maxBytes) {
@@ -509,9 +645,10 @@ internal object ConnectivitySelfTest {
 
     private fun result(
         target: Target,
+        attempt: Int,
         outcome: String,
-        config: TransferTestConfig,
         startedAtNanos: Long,
+        dohResolveMs: Long?,
         bytesReceived: AtomicInteger,
         socksConnectMs: AtomicLong,
         tlsHandshakeMs: AtomicLong,
@@ -519,9 +656,11 @@ internal object ConnectivitySelfTest {
         httpStatus: AtomicInteger
     ): TransferTestResult = TransferTestResult(
         service = target.service,
+        attempt = attempt,
         outcome = outcome,
         bytesReceived = bytesReceived.get(),
         elapsedMs = elapsedMs(startedAtNanos),
+        dohResolveMs = dohResolveMs,
         socksConnectMs = socksConnectMs.get().takeIf { it >= 0 },
         tlsHandshakeMs = tlsHandshakeMs.get().takeIf { it >= 0 },
         transferMs = transferMs.get().takeIf { it >= 0 },

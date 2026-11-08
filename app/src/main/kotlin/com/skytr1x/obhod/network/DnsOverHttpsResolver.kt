@@ -7,10 +7,10 @@ import java.io.EOFException
 import java.io.IOException
 import java.io.OutputStream
 import java.net.IDN
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
-import java.net.InetAddress
 import java.nio.charset.StandardCharsets
 import java.security.SecureRandom
 import java.util.LinkedHashMap
@@ -32,8 +32,10 @@ internal object DnsOverHttpsResolver {
         val socket: SSLSocket,
         val input: BufferedInputStream,
         val output: OutputStream,
+        val sendSni: Boolean,
         var lastUsedAtNanos: Long
     )
+    private data class DohAnswer(val bytes: ByteArray, val sendSni: Boolean)
     private data class HttpDnsResponse(
         val body: ByteArray?,
         val reusable: Boolean,
@@ -42,7 +44,8 @@ internal object DnsOverHttpsResolver {
     private data class ProviderState(
         var failures: Int = 0,
         var openUntilNanos: Long = 0,
-        var preferredEndpoint: String? = null
+        var preferredEndpoint: String? = null,
+        var preferredSni: Boolean? = null
     )
 
     private val providers = listOf(
@@ -90,33 +93,35 @@ internal object DnsOverHttpsResolver {
             if (preferredEndpoint == null) all else
                 all.sortedBy { if (it.key == preferredEndpoint) 0 else 1 }
         }
+        val preferredSni = preferredSni(networkHandle)
         for (endpoint in endpoints) {
             val remainingMs = TimeUnit.NANOSECONDS.toMillis(
                 deadline - System.nanoTime()
             ).toInt()
             if (remainingMs <= 0) break
-            val response = try {
+            val answer = try {
                 queryProvider(
                     endpoint.provider.host,
                     endpoint.ip,
                     query,
                     network,
                     protectSocket,
-                    remainingMs
+                    remainingMs,
+                    preferredSni
                 )
             } catch (_: IOException) {
                 null
             }
-            if (response != null && isDnsResponse(response, query)) {
-                cacheTtlMillis(response)?.let { ttl ->
+            if (answer != null && isDnsResponse(answer.bytes, query)) {
+                cacheTtlMillis(answer.bytes)?.let { ttl ->
                     trimCache(System.nanoTime())
                     cache[key] = CachedAnswer(
-                        response.copyOf(),
+                        answer.bytes.copyOf(),
                         System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(ttl)
                     )
                 }
-                recordDohSuccess(networkHandle, endpoint.key)
-                return response
+                recordDohSuccess(networkHandle, endpoint.key, answer.sendSni)
+                return answer.bytes
             }
         }
         recordDohFailure(networkHandle)
@@ -155,12 +160,22 @@ internal object DnsOverHttpsResolver {
             providerState(networkHandle).preferredEndpoint
         }
 
-    private fun recordDohSuccess(networkHandle: Long, endpointKey: String) {
+    private fun preferredSni(networkHandle: Long): Boolean? =
+        synchronized(providerStateLock) {
+            providerState(networkHandle).preferredSni
+        }
+
+    private fun recordDohSuccess(
+        networkHandle: Long,
+        endpointKey: String,
+        sendSni: Boolean
+    ) {
         synchronized(providerStateLock) {
             val state = providerState(networkHandle)
             state.failures = 0
             state.openUntilNanos = 0
             state.preferredEndpoint = endpointKey
+            state.preferredSni = sendSni
         }
     }
 
@@ -186,7 +201,11 @@ internal object DnsOverHttpsResolver {
         return state
     }
 
-    fun createAQuery(host: String): ByteArray? {
+    fun createAQuery(host: String): ByteArray? = createQuery(host, 1)
+
+    fun createAaaaQuery(host: String): ByteArray? = createQuery(host, 28)
+
+    private fun createQuery(host: String, recordType: Int): ByteArray? {
         val asciiHost = try {
             IDN.toASCII(host.trimEnd('.'))
         } catch (_: IllegalArgumentException) {
@@ -203,7 +222,7 @@ internal object DnsOverHttpsResolver {
             question.write(bytes)
         }
         question.write(0)
-        question.write(byteArrayOf(0, 1, 0, 1))
+        question.write(byteArrayOf(0, recordType.toByte(), 0, 1))
         val id = SecureRandom().nextInt(65536)
         return byteArrayOf(
             (id shr 8).toByte(), id.toByte(),
@@ -245,17 +264,25 @@ internal object DnsOverHttpsResolver {
         return addresses
     }
 
+    internal fun sniModeOrder(preferredSni: Boolean?): List<Boolean> =
+        when (preferredSni) {
+            true -> listOf(true, false)
+            false -> listOf(false, true)
+            null -> listOf(false, true)
+        }
+
     private fun queryProvider(
         host: String,
         ip: String,
         query: ByteArray,
         network: Network?,
         protectSocket: (Socket) -> Boolean,
-        remainingMs: Int
-    ): ByteArray? {
+        remainingMs: Int,
+        preferredSni: Boolean?
+    ): DohAnswer? {
         val deadline = System.nanoTime() +
             TimeUnit.MILLISECONDS.toNanos(remainingMs.toLong())
-        for (sendSni in listOf(false, true)) {
+        for (sendSni in sniModeOrder(preferredSni)) {
             val timeoutMs = remainingTimeoutMs(deadline)
             if (timeoutMs <= 0) return null
             val response = try {
@@ -284,7 +311,7 @@ internal object DnsOverHttpsResolver {
         protectSocket: (Socket) -> Boolean,
         remainingMs: Int,
         sendSni: Boolean
-    ): ByteArray? {
+    ): DohAnswer? {
         val networkHandle = network?.networkHandle ?: 0L
         val key = ConnectionKey(networkHandle, host)
         val connections = checkNotNull(threadConnections.get())
@@ -309,7 +336,7 @@ internal object DnsOverHttpsResolver {
                     } else {
                         closeConnection(pooled)
                     }
-                    return response.body
+                    return DohAnswer(response.body, pooled.sendSni)
                 }
                 closeConnection(pooled)
                 if (!response.retryOnNewConnection) return null
@@ -336,7 +363,7 @@ internal object DnsOverHttpsResolver {
             } else {
                 closeConnection(connection)
             }
-            return response.body
+            return response.body?.let { DohAnswer(it, sendSni) }
         } catch (error: IOException) {
             closeConnection(connection)
             throw error
@@ -379,6 +406,7 @@ internal object DnsOverHttpsResolver {
                 ssl,
                 BufferedInputStream(ssl.inputStream),
                 ssl.outputStream,
+                sendSni,
                 System.nanoTime()
             )
         } catch (error: IOException) {

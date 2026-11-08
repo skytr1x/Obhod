@@ -109,28 +109,38 @@ class DiagnosticReportTest {
     fun parsesResultsFromTheLatestTransferTestRun() {
         val summary = DiagnosticReport.latestSelfTest(
             listOf(
-                "[SELFTEST_RUN] payload_kib=100 host_timeout_s=15 idle_timeout_s=4",
-                "[SELFTEST] service=youtube outcome=success bytes=102400 elapsed_ms=1200 socks_ms=50 tls_ms=300 transfer_ms=800 http=206",
-                "[SELFTEST_RUN] payload_kib=200 host_timeout_s=15 idle_timeout_s=8",
-                "[SELFTEST] service=discord outcome=idle_timeout bytes=32768 elapsed_ms=4500 socks_ms=60 tls_ms=400 transfer_ms=3000 http=200"
+                "[SELFTEST_RUN] repetitions=3 payload_kib=100 host_timeout_s=15 idle_timeout_s=4",
+                "[SELFTEST] service=youtube attempt=1 outcome=complete bytes=102400 elapsed_ms=1200 socks_ms=50 doh_ms=20 tls_ms=300 transfer_ms=800 http=206",
+                "[SELFTEST_RUN] repetitions=3 payload_kib=200 host_timeout_s=15 idle_timeout_s=8",
+                "[SELFTEST] service=discord attempt=1 outcome=reached_http_non_2xx bytes=1200 elapsed_ms=4000 socks_ms=60 doh_ms=30 tls_ms=400 transfer_ms=3000 http=403",
+                "[SELFTEST] service=discord attempt=2 outcome=idle_timeout bytes=32768 elapsed_ms=5000 socks_ms=70 doh_ms=20 tls_ms=450 transfer_ms=3500 http=-",
+                "[SELFTEST] service=discord attempt=3 outcome=reached_http_non_2xx bytes=2400 elapsed_ms=6000 socks_ms=65 doh_ms=25 tls_ms=420 transfer_ms=4000 http=429"
             )
         )
 
         assertEquals(200, summary?.config?.payloadKiB)
         assertEquals(15, summary?.config?.hostTimeoutSeconds)
         assertEquals(8, summary?.config?.idleTimeoutSeconds)
-        assertEquals(1, summary?.results?.size)
-        assertEquals("discord", summary?.results?.single()?.service)
-        assertEquals("idle_timeout", summary?.results?.single()?.outcome)
-        assertEquals(32768, summary?.results?.single()?.bytesReceived)
+        assertEquals(3, summary?.repetitions)
+        assertEquals(3, summary?.results?.size)
+        assertEquals("discord", summary?.results?.get(1)?.service)
+        assertEquals("idle_timeout", summary?.results?.get(1)?.outcome)
+        assertEquals(32768, summary?.results?.get(1)?.bytesReceived)
+        val discord = summary?.serviceStats()?.single()
+        assertEquals(2, discord?.httpResponsesReceived)
+        assertEquals(3, discord?.attempts)
+        assertEquals(5000L, discord?.medianElapsedMs)
+        assertEquals(2400, discord?.medianBytesReceived)
     }
 
     @Test
     fun reportIncludesTransferMeasurementWithoutRawAddresses() {
         val summary = DiagnosticReport.latestSelfTest(
             listOf(
-                "[SELFTEST_RUN] payload_kib=150 host_timeout_s=15 idle_timeout_s=4",
-                "[SELFTEST] service=cloudflare outcome=success bytes=153600 elapsed_ms=1100 socks_ms=40 tls_ms=250 transfer_ms=750 http=200"
+                "[SELFTEST_RUN] repetitions=3 payload_kib=150 host_timeout_s=15 idle_timeout_s=4",
+                "[SELFTEST] service=cloudflare attempt=1 outcome=complete bytes=153600 elapsed_ms=1100 socks_ms=40 doh_ms=20 tls_ms=250 transfer_ms=750 http=200",
+                "[SELFTEST] service=cloudflare attempt=2 outcome=complete bytes=153600 elapsed_ms=1200 socks_ms=42 doh_ms=18 tls_ms=260 transfer_ms=760 http=200",
+                "[SELFTEST] service=cloudflare attempt=3 outcome=complete bytes=153600 elapsed_ms=1300 socks_ms=44 doh_ms=17 tls_ms=270 transfer_ms=770 http=200"
             )
         )
         val report = DiagnosticReport.format(
@@ -156,7 +166,8 @@ class DiagnosticReportTest {
             )
         )
 
-        assertTrue(report.contains("Cloudflare control: success, 153600 bytes"))
+        assertTrue(report.contains("Cloudflare control: HTTP-ответ 3/3 (100%)"))
+        assertTrue(report.contains("Cloudflare control run 1: complete, 153600 bytes"))
         assertTrue(report.contains("HTTP=200"))
         assertFalse(report.contains("speed.cloudflare.com"))
         assertFalse(report.contains("https://"))
@@ -166,7 +177,7 @@ class DiagnosticReportTest {
     fun ignoresSelfTestLogWithNonstandardHostTimeout() {
         assertNull(
             DiagnosticReport.latestSelfTest(
-                listOf("[SELFTEST_RUN] payload_kib=100 host_timeout_s=5 idle_timeout_s=4")
+                listOf("[SELFTEST_RUN] repetitions=3 payload_kib=100 host_timeout_s=5 idle_timeout_s=4")
             )
         )
     }

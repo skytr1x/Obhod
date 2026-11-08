@@ -40,10 +40,10 @@ internal object DiagnosticReport {
         """^\[METRIC] kind=tls_success strategy=([^\s]+) connect_rtt_ms=(\d+) tls_response_ms=(\d+)$"""
     )
     private val selfTestStartPattern = Regex(
-        """^\[SELFTEST_RUN] payload_kib=(\d+) host_timeout_s=(\d+) idle_timeout_s=(\d+)$"""
+        """^\[SELFTEST_RUN] repetitions=(\d+) payload_kib=(\d+) host_timeout_s=(\d+) idle_timeout_s=(\d+)$"""
     )
     private val selfTestResultPattern = Regex(
-        """^\[SELFTEST] service=(youtube|discord|4pda|cloudflare) outcome=([a-z_]+) bytes=(\d+) elapsed_ms=(\d+) socks_ms=(\d+|-) tls_ms=(\d+|-) transfer_ms=(\d+|-) http=(\d+|-)$"""
+        """^\[SELFTEST] service=(youtube|discord|4pda|cloudflare) attempt=(\d+) outcome=([a-z0-9_]+) bytes=(\d+) elapsed_ms=(\d+) socks_ms=(\d+|-) doh_ms=(\d+|-) tls_ms=(\d+|-) transfer_ms=(\d+|-) http=(\d+|-)$"""
     )
 
     fun latestTlsSuccess(messages: List<String>): TlsSuccessMetric? =
@@ -67,13 +67,15 @@ internal object DiagnosticReport {
         val startIndex = messages.indexOfLast { selfTestStartPattern.matches(it) }
         if (startIndex < 0) return null
         val configMatch = selfTestStartPattern.matchEntire(messages[startIndex]) ?: return null
+        val repetitions = configMatch.groupValues[1].toIntOrNull() ?: return null
+        if (repetitions != ConnectivitySelfTest.REPETITIONS) return null
         val config = TransferTestConfig(
-            payloadKiB = configMatch.groupValues[1].toIntOrNull() ?: return null,
-            idleTimeoutSeconds = configMatch.groupValues[3].toIntOrNull() ?: return null
+            payloadKiB = configMatch.groupValues[2].toIntOrNull() ?: return null,
+            idleTimeoutSeconds = configMatch.groupValues[4].toIntOrNull() ?: return null
         )
-        if (configMatch.groupValues[2].toIntOrNull() != config.hostTimeoutSeconds) return null
+        if (configMatch.groupValues[3].toIntOrNull() != config.hostTimeoutSeconds) return null
         val results = messages.drop(startIndex + 1).mapNotNull(::parseSelfTestResult)
-        return TransferTestSummary(config, results)
+        return TransferTestSummary(config, repetitions, results)
     }
 
     fun format(data: DiagnosticReportData): String = buildString {
@@ -120,34 +122,37 @@ internal object DiagnosticReport {
             appendLine("Проверка передачи данных: не запускалась")
         } else {
             appendLine(
-                "Самотест: до ${selfTest.config.payloadKiB} KiB на сервис, " +
-                    "${selfTest.config.hostTimeoutSeconds} s/хост, " +
+                "Самотест: ${selfTest.repetitions} прогона; до ${selfTest.config.payloadKiB} KiB " +
+                    "на ответ, до ${selfTest.config.hostTimeoutSeconds} s на попытку, " +
                     "idle ${selfTest.config.idleTimeoutSeconds} s"
             )
             if (selfTest.results.isEmpty()) {
                 appendLine("Результаты самотеста: нет")
             } else {
-                selfTest.results.forEach { result ->
-                    val service = when (result.service) {
-                        "youtube" -> "YouTube"
-                        "discord" -> "Discord"
-                        "4pda" -> "4pda"
-                        else -> "Cloudflare control"
-                    }
-                    val transferRate = if ((result.transferMs ?: 0L) > 0) {
-                        String.format(
-                            java.util.Locale.ROOT,
-                            "%.1f",
-                            result.bytesReceived * 1000.0 /
-                                1024.0 / (result.transferMs ?: 1L)
-                        )
+                selfTest.serviceStats().forEach { stats ->
+                    val service = serviceLabel(stats.service)
+                    val httpResponsePercent = if (stats.attempts > 0) {
+                        stats.httpResponsesReceived * 100 / stats.attempts
                     } else {
-                        "неизвестно"
+                        0
                     }
+                    val medianRate = stats.medianTransferKiBPerSecond?.let {
+                        String.format(java.util.Locale.ROOT, "%.1f KiB/s", it)
+                    } ?: "нет данных"
                     appendLine(
-                        "$service: ${result.outcome}, ${result.bytesReceived} bytes, " +
-                            "total=${result.elapsedMs} ms, transfer=${result.transferMs ?: "?"} ms, " +
-                            "$transferRate KiB/s, TLS=${result.tlsHandshakeMs ?: "?"} ms, " +
+                        "$service: HTTP-ответ ${stats.httpResponsesReceived}/${stats.attempts} " +
+                            "($httpResponsePercent%), медиана времени ${stats.medianElapsedMs ?: "?"} ms, " +
+                            "медиана тела ${stats.medianBytesReceived ?: "?"} bytes, " +
+                            "медианная скорость $medianRate"
+                    )
+                }
+                selfTest.results.forEach { result ->
+                    appendLine(
+                        "${serviceLabel(result.service)} run ${result.attempt}: ${result.outcome}, " +
+                            "${result.bytesReceived} bytes, total=${result.elapsedMs} ms, " +
+                            "DoH=${result.dohResolveMs ?: "?"} ms, " +
+                            "transfer=${result.transferMs ?: "?"} ms, " +
+                            "TLS=${result.tlsHandshakeMs ?: "?"} ms, " +
                             "HTTP=${result.httpStatus ?: "?"}"
                     )
                 }
@@ -179,14 +184,23 @@ internal object DiagnosticReport {
             match.groupValues[group].takeIf { it != "-" }?.toIntOrNull()
         return TransferTestResult(
             service = match.groupValues[1],
-            outcome = match.groupValues[2],
-            bytesReceived = match.groupValues[3].toIntOrNull() ?: return null,
-            elapsedMs = match.groupValues[4].toLongOrNull() ?: return null,
-            socksConnectMs = optionalLong(5),
-            tlsHandshakeMs = optionalLong(6),
-            transferMs = optionalLong(7),
-            httpStatus = optionalInt(8)
+            attempt = match.groupValues[2].toIntOrNull() ?: return null,
+            outcome = match.groupValues[3],
+            bytesReceived = match.groupValues[4].toIntOrNull() ?: return null,
+            elapsedMs = match.groupValues[5].toLongOrNull() ?: return null,
+            socksConnectMs = optionalLong(6),
+            dohResolveMs = optionalLong(7),
+            tlsHandshakeMs = optionalLong(8),
+            transferMs = optionalLong(9),
+            httpStatus = optionalInt(10)
         )
+    }
+
+    private fun serviceLabel(service: String): String = when (service) {
+        "youtube" -> "YouTube"
+        "discord" -> "Discord"
+        "4pda" -> "4pda"
+        else -> "Cloudflare control"
     }
 
     private fun dnsInterpretation(comparison: String): String = when (comparison) {

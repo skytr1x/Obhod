@@ -43,6 +43,7 @@ import android.net.Uri
 import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
 
 class MainActivity : AppCompatActivity() {
@@ -269,27 +270,50 @@ class MainActivity : AppCompatActivity() {
         }
 
         transferTestRunning = true
-        transferTestStatus = "Тест передачи выполняется…"
+        transferTestStatus = "Проверка DNS и передачи выполняется…"
+        val connectivity = getSystemService(ConnectivityManager::class.java)
+        val network = connectivity?.let(::underlyingNetworkForReport)
         AppLog.i(
             "SelfTest",
-            "[SELFTEST_RUN] payload_kib=${config.payloadKiB} " +
+            "[SELFTEST_RUN] repetitions=${ConnectivitySelfTest.REPETITIONS} " +
+                "payload_kib=${config.payloadKiB} " +
                 "host_timeout_s=${config.hostTimeoutSeconds} " +
                 "idle_timeout_s=${config.idleTimeoutSeconds}"
         )
         lifecycleScope.launch {
             try {
-                withContext(Dispatchers.IO) {
-                    ConnectivitySelfTest.run(
-                        config = config,
-                        onProgress = { service ->
-                            AppLog.i("SelfTest", "[SELFTEST_PROGRESS] service=$service")
-                        },
-                        onResult = { result ->
-                            AppLog.i("SelfTest", result.asLogMessage())
-                        }
-                    )
+                val summary = withContext(Dispatchers.IO) {
+                    runInterruptible {
+                        ConnectivitySelfTest.run(
+                            config = config,
+                            network = network,
+                            onProgress = { service, attempt ->
+                                val label = when (service) {
+                                    "youtube" -> "YouTube"
+                                    "discord" -> "Discord"
+                                    "4pda" -> "4pda"
+                                    else -> "Cloudflare"
+                                }
+                                runOnUiThread {
+                                    transferTestStatus =
+                                        "Прогон $attempt/${ConnectivitySelfTest.REPETITIONS}: $label"
+                                }
+                                AppLog.i(
+                                    "SelfTest",
+                                    "[SELFTEST_PROGRESS] attempt=$attempt service=$service"
+                                )
+                            },
+                            onResult = { result ->
+                                AppLog.i("SelfTest", result.asLogMessage())
+                            }
+                        )
+                    }
                 }
-                transferTestStatus = "Тест завершён; результаты добавлены в логи."
+                val serviceStats = summary.serviceStats()
+                val reached = serviceStats.sumOf { it.httpResponsesReceived }
+                val total = serviceStats.sumOf { it.attempts }
+                transferTestStatus =
+                    "Готово: HTTP-ответ получен в $reached из $total попыток. Результаты в отчёте."
             } catch (error: IOException) {
                 AppLog.e("SelfTest", "Тест передачи завершился с ошибкой", error)
                 transferTestStatus = "Тест завершился с ошибкой; подробности в логах."

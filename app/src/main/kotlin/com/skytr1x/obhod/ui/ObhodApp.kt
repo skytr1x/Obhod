@@ -789,14 +789,17 @@ private fun LogsScreen(
                 CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
                 Spacer(Modifier.width(10.dp))
             }
-            Text(if (transferTestRunning) "Тест передачи выполняется…" else "Проверить HTTPS-передачу")
+            Text(
+                if (transferTestRunning) "Тест передачи выполняется…"
+                else "Проверить HTTPS-передачу (3 прогона)"
+            )
         }
         Text(
             text = when {
                 transferTestRunning -> transferTestStatus
                 !vpnRunning -> "Для проверки выбранных стратегий сначала включите VPN."
                 transferTestStatus.isNotBlank() -> transferTestStatus
-                else -> "Тест отправит до 200 KiB на каждый из четырёх выбранных сервисов."
+                else -> "Три прогона четырёх сервисов; максимум около 2.4 MiB данных."
             },
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -878,10 +881,12 @@ private fun LogsScreen(
                         verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
                         Text(
-                            "Тест по очереди установит TLS-соединение и запросит до выбранного " +
-                                "объёма данных у YouTube, Discord, 4pda и Cloudflare. Запросы " +
-                                "выполняются только после нажатия «Начать тест» и не содержат " +
-                                "учётных данных. Результаты останутся в локальных логах."
+                            "Тест трижды проверит HTTPS через DoH-адресацию и SOCKS для YouTube, " +
+                                "Discord, 4pda и Cloudflare. На попытку отводится до 15 секунд; " +
+                                "за один ответ будет прочитано не больше выбранного объёма. Любой " +
+                                "полученный HTTP-статус считается достижением сервера, даже если " +
+                                "это редирект или отказ. Запросы не содержат учётных данных; " +
+                                "результаты останутся в локальных логах."
                         )
                         TransferTestOption(
                             label = "Лимит данных на сервис",
@@ -890,7 +895,7 @@ private fun LogsScreen(
                             options = TransferTestConfig.PAYLOAD_OPTIONS_KIB,
                             onSelected = { payloadKiB = it }
                         )
-                        Text("Максимум 15 секунд на сервис.")
+                        Text("До 15 секунд на попытку; полный тест может занять до 3 минут.")
                         TransferTestOption(
                             label = "Таймаут без новых данных",
                             value = idleTimeoutSeconds,

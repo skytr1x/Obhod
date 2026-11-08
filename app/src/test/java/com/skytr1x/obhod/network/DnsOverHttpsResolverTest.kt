@@ -36,6 +36,23 @@ class DnsOverHttpsResolverTest {
     }
 
     @Test
+    fun createsIpv6QueryWithExpectedRecordType() {
+        assertEquals(
+            listOf(0, 28, 0, 1),
+            DnsOverHttpsResolver.createAaaaQuery("example.com")
+                ?.takeLast(4)
+                ?.map { it.toInt() and 0xff }
+        )
+    }
+
+    @Test
+    fun preferredSniModeIsTriedBeforeFallback() {
+        assertEquals(listOf(true, false), DnsOverHttpsResolver.sniModeOrder(true))
+        assertEquals(listOf(false, true), DnsOverHttpsResolver.sniModeOrder(false))
+        assertEquals(listOf(false, true), DnsOverHttpsResolver.sniModeOrder(null))
+    }
+
+    @Test
     fun ipAnswersIncludesIpv4AndIpv6Records() {
         val ipv6 = byteArrayOf(
             0x20, 0x01, 0x0d, 0xb8.toByte(), 0, 0, 0, 0,
