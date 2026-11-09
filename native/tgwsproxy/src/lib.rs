@@ -3,6 +3,7 @@ pub mod cfproxy;
 pub mod config;
 pub mod crypto;
 pub mod faketls;
+pub mod network_operations;
 pub mod proxy;
 pub mod ws;
 
@@ -298,5 +299,55 @@ pub unsafe extern "C" fn FreeString(p: *mut c_char) {
     }
     unsafe {
         let _ = CString::from_raw(p);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn FetchDomainList(output: *mut u8, capacity: c_int) -> c_int {
+    if output.is_null() || capacity <= 0 {
+        return -3;
+    }
+    let output = unsafe { std::slice::from_raw_parts_mut(output, capacity as usize) };
+    match runtime().block_on(network_operations::fetch_domain_list(output)) {
+        Ok(length) => length as c_int,
+        Err(network_operations::DomainListError::HttpStatus(status)) => -(1000 + status as c_int),
+        Err(network_operations::DomainListError::TooLarge) => -2,
+        Err(
+            network_operations::DomainListError::Request(_)
+            | network_operations::DomainListError::ResponseTimeout,
+        ) => -1,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn RunTransferTest(
+    c_service: *const c_char,
+    c_host: *const c_char,
+    c_resolved_ip: *const c_char,
+    c_path: *const c_char,
+    attempt: c_int,
+    payload_kib: c_int,
+    host_timeout_ms: c_int,
+    idle_timeout_seconds: c_int,
+) -> *mut c_char {
+    let service = cstr_to_string(c_service);
+    let host = cstr_to_string(c_host);
+    let resolved_ip = cstr_to_string(c_resolved_ip);
+    let path = cstr_to_string(c_path);
+    let result = runtime().block_on(network_operations::run_transfer_test(
+        network_operations::TransferTestRequest {
+            service,
+            host,
+            resolved_ip,
+            path,
+            attempt,
+            payload_kib,
+            host_timeout_ms,
+            idle_timeout_seconds,
+        },
+    ));
+    match result.and_then(|result| CString::new(result).ok()) {
+        Some(value) => value.into_raw(),
+        None => std::ptr::null_mut(),
     }
 }

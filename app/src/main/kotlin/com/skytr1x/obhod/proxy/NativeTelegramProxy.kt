@@ -2,16 +2,29 @@ package com.skytr1x.obhod.proxy
 
 import com.sun.jna.Library
 import com.sun.jna.Native
+import com.sun.jna.Pointer
 
-private interface TelegramProxyLibrary : Library {
+internal interface TelegramProxyLibrary : Library {
     fun StartProxy(host: String, port: Int, dcIps: String, secret: String, verbose: Int): Int
     fun StopProxy(): Int
     fun SetPoolSize(size: Int)
     fun SetCfProxyCacheDir(path: String)
+    fun FetchDomainList(output: ByteArray, capacity: Int): Int
+    fun RunTransferTest(
+        service: String,
+        host: String,
+        resolvedIp: String,
+        path: String,
+        attempt: Int,
+        payloadKiB: Int,
+        hostTimeoutMillis: Int,
+        idleTimeoutSeconds: Int
+    ): Pointer?
+    fun FreeString(value: Pointer)
 }
 
 object NativeTelegramProxy {
-    private val library: TelegramProxyLibrary by lazy {
+    internal val library: TelegramProxyLibrary by lazy {
         Native.load("tgwsproxy", TelegramProxyLibrary::class.java)
     }
 
