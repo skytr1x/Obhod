@@ -2,14 +2,19 @@ package com.skytr1x.obhod.strategy
 
 import android.content.Context
 import android.system.Os
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
-import com.skytr1x.obhod.proxy.NativeNetworkOperations
+import java.net.HttpURLConnection
+import java.net.URL
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Locale
 
 object DomainListRepository {
+    private const val LIST_URL =
+        "https://raw.githubusercontent.com/skytr1x/Obhod/main/list/list.json"
+    private const val MAX_DOWNLOAD_BYTES = 8 * 1024 * 1024
     private const val MAX_DOMAINS = 100_000
     private const val PREFERENCES = "zapret"
     private const val LAST_UPDATED_KEY = "domain_list_updated_at"
@@ -22,19 +27,51 @@ object DomainListRepository {
 
     suspend fun update(context: Context): UpdateResult =
         kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-            val bytes = NativeNetworkOperations.fetchDomainList()
-            val domains = parseDomains(bytes.toString(Charsets.UTF_8))
-            val updatedAt = System.currentTimeMillis()
-            saveAtomically(context, JSONObject()
-                .put("version", 1)
-                .put("include", JSONArray(domains))
-                .toString()
-                .toByteArray(Charsets.UTF_8))
-            context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
-                .edit()
-                .putLong(LAST_UPDATED_KEY, updatedAt)
-                .apply()
-            UpdateResult(domains.size, updatedAt)
+            val connection = URL(LIST_URL).openConnection() as HttpURLConnection
+            connection.connectTimeout = 10_000
+            connection.readTimeout = 10_000
+            connection.instanceFollowRedirects = false
+            connection.setRequestProperty("Accept", "application/json")
+            connection.setRequestProperty("User-Agent", "Obhod-Android")
+
+            try {
+                if (connection.url.protocol != "https") {
+                    error("Список должен загружаться по HTTPS")
+                }
+                val responseCode = connection.responseCode
+                if (responseCode != HttpURLConnection.HTTP_OK) {
+                    error("Сервер списка ответил HTTP $responseCode")
+                }
+                val bytes = connection.inputStream.use { input ->
+                    val output = ByteArrayOutputStream()
+                    val buffer = ByteArray(8 * 1024)
+                    var total = 0
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        total += read
+                        require(total <= MAX_DOWNLOAD_BYTES) {
+                            "Файл списка превышает допустимый размер"
+                        }
+                        output.write(buffer, 0, read)
+                    }
+                    output.toByteArray()
+                }
+                val domains = parseDomains(bytes.toString(Charsets.UTF_8))
+                val updatedAt = System.currentTimeMillis()
+                saveAtomically(context, JSONObject()
+                    .put("version", 1)
+                    .put("include", JSONArray(domains))
+                    .toString()
+                    .toByteArray(Charsets.UTF_8))
+                context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+                    .edit()
+                    .putLong(LAST_UPDATED_KEY, updatedAt)
+                    .apply()
+                UpdateResult(domains.size, updatedAt)
+            } finally {
+                connection.disconnect()
+            }
         }
 
     fun lastUpdated(context: Context): Long =
