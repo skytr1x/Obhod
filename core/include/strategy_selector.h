@@ -45,7 +45,9 @@ public:
                      long latencyMs = -1, const std::string& scope = std::string());
     void markFailure(const std::string& host, const std::string& strategyId,
                      const std::string& scope = std::string());
-    bool allowAdaptiveAttempt(const std::string& host, const std::string& scope);
+    bool allowAdaptiveAttempt(const std::string& host,
+                              const std::string& strategyId,
+                              const std::string& scope);
     void markHostUnavailable(const std::string& host, const std::string& scope);
     bool hostUnavailableCached(const std::string& host, const std::string& scope) const;
 

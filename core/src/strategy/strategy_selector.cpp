@@ -101,12 +101,19 @@ bool StrategySelector::adaptiveChainEnabled() const {
 }
 
 bool StrategySelector::allowAdaptiveAttempt(const std::string& rawHost,
+                                            const std::string& strategyId,
                                             const std::string& scope) {
     const std::string host = normalizeHost(rawHost);
     const std::string key = stateKeyFor(host, scope);
     std::lock_guard<std::mutex> lock(m_mutex);
     const int limit = m_profile ? m_profile->adaptiveAttemptsPerMinute : 0;
     if (limit <= 0) return true;
+
+    const auto hostState = m_cache.find(key);
+    if (hostState != m_cache.end() &&
+        hostState->second.preferred == strategyId) {
+        return true;
+    }
 
     const auto now = std::chrono::steady_clock::now();
     auto& attempts = m_adaptiveAttempts[key];
@@ -494,8 +501,8 @@ std::vector<StrategyChoice> StrategySelector::candidatesLocked(const std::string
         }
     }
 
+    const auto now = std::chrono::steady_clock::now();
     if (state && !state->metrics.empty()) {
-        const auto now = std::chrono::steady_clock::now();
         auto metricFor = [&](const StrategyChoice& choice) {
             auto it = state->metrics.find(choice.key());
             return it == state->metrics.end() ? nullptr : &it->second;
@@ -531,12 +538,43 @@ std::vector<StrategyChoice> StrategySelector::candidatesLocked(const std::string
                          });
     }
 
-    for (auto& choice : expanded) {
-        out.push_back(std::move(choice));
+    for (auto& choice : expanded) out.push_back(std::move(choice));
+
+    bool learnedWinner = false;
+    bool directFailureActive = false;
+    bool directRecheckDue = false;
+    if (state) {
+        if (!state->preferred.empty() && !isDirectId(state->preferred) &&
+            !isTunnelId(state->preferred)) {
+            auto preferred = std::find_if(out.begin(), out.end(),
+                                          [&](const StrategyChoice& choice) {
+                                              return choice.key() == state->preferred;
+                                          });
+            if (preferred != out.end()) {
+                if (preferred != out.begin()) {
+                    std::rotate(out.begin(), preferred, std::next(preferred));
+                }
+                learnedWinner = true;
+            }
+        }
+
+        const auto directMetric = state->metrics.find("direct");
+        if (directMetric != state->metrics.end() &&
+            state->preferred != "direct") {
+            directFailureActive =
+                decayedFailures(directMetric->second, now) > 0.01;
+            directRecheckDue = !directFailureActive;
+        }
     }
 
     if (hasDirect) {
-        if (m_profile->directFirst && !udp) {
+        if (m_profile->directFirst && !udp && directRecheckDue) {
+            out.insert(out.begin(), std::move(directChoice));
+        } else if (m_profile->directFirst && !udp && learnedWinner) {
+            out.insert(std::next(out.begin()), std::move(directChoice));
+        } else if (m_profile->directFirst && !udp && directFailureActive) {
+            out.push_back(std::move(directChoice));
+        } else if (m_profile->directFirst && !udp) {
             out.insert(out.begin(), std::move(directChoice));
         } else {
             out.push_back(std::move(directChoice));
@@ -545,7 +583,13 @@ std::vector<StrategyChoice> StrategySelector::candidatesLocked(const std::string
         StrategyChoice choice;
         choice.owner = m_profile;
         choice.direct = true;
-        if (m_profile->directFirst && !udp) {
+        if (m_profile->directFirst && !udp && directRecheckDue) {
+            out.insert(out.begin(), std::move(choice));
+        } else if (m_profile->directFirst && !udp && learnedWinner) {
+            out.insert(std::next(out.begin()), std::move(choice));
+        } else if (m_profile->directFirst && !udp && directFailureActive) {
+            out.push_back(std::move(choice));
+        } else if (m_profile->directFirst && !udp) {
             out.insert(out.begin(), std::move(choice));
         } else {
             out.push_back(std::move(choice));

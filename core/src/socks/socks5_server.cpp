@@ -1506,7 +1506,7 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
         const bool adaptiveAttempt = choice.strategy && choice.strategy->adaptive;
 
         if (adaptiveAttempt && m_selector &&
-            !m_selector->allowAdaptiveAttempt(host, strategyScope)) {
+            !m_selector->allowAdaptiveAttempt(host, strategyId, strategyScope)) {
             emitEvent("[ADAPTIVE] host=%s profile=%s outcome=rate_limited limit_per_minute",
                       host.c_str(), strategyId.c_str());
             continue;

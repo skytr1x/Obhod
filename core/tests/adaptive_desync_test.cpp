@@ -76,20 +76,55 @@ int main() {
         return 1;
     }
 
+    selector.markFailure("blocked.example", "direct", "tcp-443");
+    selector.markSuccess("blocked.example", "adaptive-p3", 120, "tcp-443");
+    const auto afterDirectFailure =
+        selector.candidates("blocked.example", false, "tcp-443");
+    if (!require(afterDirectFailure.front().key() == "adaptive-p3" &&
+                     afterDirectFailure[1].key() == "direct",
+                 "A learned adaptive winner must precede a recently failed direct attempt")) {
+        return 1;
+    }
+    for (int success = 0; success < 6; ++success) {
+        selector.markSuccess("blocked.example", "adaptive-p3", 100, "tcp-443");
+    }
+    const auto afterDirectRecheck =
+        selector.candidates("blocked.example", false, "tcp-443");
+    if (!require(afterDirectRecheck.front().key() == "direct",
+                 "Direct must be rechecked after repeated adaptive successes")) {
+        return 1;
+    }
+
     for (int attempt = 0; attempt < profile->adaptiveAttemptsPerMinute; ++attempt) {
-        if (!require(selector.allowAdaptiveAttempt("blocked.example", "tcp-443"),
+        if (!require(selector.allowAdaptiveAttempt(
+                         "blocked.example", "adaptive-p1", "tcp-443"),
                      "Attempts within the per-domain minute budget must be allowed")) {
             return 1;
         }
     }
-    if (!require(!selector.allowAdaptiveAttempt("blocked.example", "tcp-443"),
+    if (!require(!selector.allowAdaptiveAttempt(
+                     "blocked.example", "adaptive-p1", "tcp-443"),
                  "The per-domain minute budget must stop additional adaptive attempts") ||
-        !require(selector.allowAdaptiveAttempt("neighbor.example", "tcp-443"),
+        !require(selector.allowAdaptiveAttempt(
+                     "neighbor.example", "adaptive-p1", "tcp-443"),
                  "The attempt budget must be isolated per domain")) {
         return 1;
     }
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        if (!require(selector.allowAdaptiveAttempt(
+                         "blocked.example", "adaptive-p3", "tcp-443"),
+                     "A cached adaptive winner must bypass an exhausted exploration budget")) {
+            return 1;
+        }
+    }
+    if (!require(!selector.allowAdaptiveAttempt(
+                     "blocked.example", "adaptive-p2", "tcp-443"),
+                 "Cached winner attempts must not change the exploration budget")) {
+        return 1;
+    }
     selector.setNetworkKey("next-network");
-    if (!require(selector.allowAdaptiveAttempt("blocked.example", "tcp-443"),
+    if (!require(selector.allowAdaptiveAttempt(
+                     "blocked.example", "adaptive-p1", "tcp-443"),
                  "Changing networks must clear the in-memory attempt budget")) {
         return 1;
     }
