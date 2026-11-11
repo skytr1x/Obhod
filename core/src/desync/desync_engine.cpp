@@ -390,7 +390,7 @@ SendOutcome DesyncEngine::sendWithPlan(int fd, const std::uint8_t* data, std::si
                         return outcome;
                     }
                 }
-                lp = pos;
+                lp = std::min(pos + 1, buffer.size());
                 break;
             }
 

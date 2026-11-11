@@ -50,6 +50,7 @@ struct StrategyDef {
     int cost = 10;
     TcpPlan tcp;
     UdpPlan udp;
+    bool adaptive = false;
     bool tunnel = false;
     bool direct = false;
 };
@@ -67,6 +68,9 @@ struct Profile {
     bool directRu = true;
     int delayMs = 0;
     bool quicFallback = true;
+    bool directFirst = false;
+    int adaptiveAttemptsPerMinute = 0;
+    int maxStrategyAttempts = 10;
 
     std::vector<StrategyDef> strategies;
     std::vector<HostRule> rules;

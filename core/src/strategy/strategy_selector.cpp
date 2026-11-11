@@ -90,6 +90,35 @@ std::vector<int> ttlValuesFor(const StrategyDef* strategy, bool udp) {
 
 }
 
+int StrategySelector::maxStrategyAttempts() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_profile ? m_profile->maxStrategyAttempts : 10;
+}
+
+bool StrategySelector::adaptiveChainEnabled() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_profile && m_profile->adaptiveAttemptsPerMinute > 0;
+}
+
+bool StrategySelector::allowAdaptiveAttempt(const std::string& rawHost,
+                                            const std::string& scope) {
+    const std::string host = normalizeHost(rawHost);
+    const std::string key = stateKeyFor(host, scope);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const int limit = m_profile ? m_profile->adaptiveAttemptsPerMinute : 0;
+    if (limit <= 0) return true;
+
+    const auto now = std::chrono::steady_clock::now();
+    auto& attempts = m_adaptiveAttempts[key];
+    while (!attempts.empty() &&
+           now - attempts.front() >= std::chrono::minutes(1)) {
+        attempts.pop_front();
+    }
+    if (attempts.size() >= static_cast<std::size_t>(limit)) return false;
+    attempts.push_back(now);
+    return true;
+}
+
 StrategySelector::StrategySelector(std::shared_ptr<Profile> profile)
     : m_profile(profile ? std::move(profile) : defaultProfile()) {}
 
@@ -126,6 +155,7 @@ std::size_t StrategySelector::setNetworkKey(const std::string& networkKey) {
     if (key != m_networkKey) {
         m_networkKey = key;
         m_cache.clear();
+        m_adaptiveAttempts.clear();
         m_networkTcpOrder.clear();
         m_networkPreferredTcp.clear();
         m_networkPreferredUdp.clear();
@@ -277,8 +307,10 @@ StrategyChoice StrategySelector::routeLocked(const std::string& rawHost, bool ud
             }
             const StrategyDef* strategy = m_profile->findStrategy(rule);
             if (strategy && isUsable(strategy, udp)) {
-                choice.strategy = strategy;
-                return choice;
+                if (!m_profile->directFirst || udp) {
+                    choice.strategy = strategy;
+                    return choice;
+                }
             }
             if (strategy && !udp) {
                 choice.direct = true;
@@ -363,7 +395,7 @@ std::vector<StrategyChoice> StrategySelector::candidatesLocked(const std::string
         ordered.push_back(strategy);
     };
 
-    if (ruleStrategy) {
+    if (ruleStrategy && (!m_profile->directFirst || udp)) {
         seen.insert(ruleStrategy);
         ordered.push_back(ruleStrategy);
     }
@@ -379,6 +411,9 @@ std::vector<StrategyChoice> StrategySelector::candidatesLocked(const std::string
         for (const auto& id : m_networkTcpOrder) addById(id);
     }
     for (const auto& id : defaults) addById(id);
+    if (ruleStrategy && m_profile->directFirst && !udp) {
+        addById(ruleStrategy->id);
+    }
 
     std::vector<const StrategyDef*> byCost;
     for (const auto& strategy : m_profile->strategies) {
@@ -479,7 +514,11 @@ std::vector<StrategyChoice> StrategySelector::candidatesLocked(const std::string
 
                              const bool aTested = am && am->attempts > 0;
                              const bool bTested = bm && bm->attempts > 0;
-                             if (aTested != bTested) return aTested;
+                             if (aTested != bTested) {
+                                 return m_profile->adaptiveAttemptsPerMinute > 0
+                                     ? !aTested
+                                     : aTested;
+                             }
                              const double ar = aTested
                                  ? static_cast<double>(am->successes) / am->attempts : 0.0;
                              const double br = bTested
@@ -497,12 +536,20 @@ std::vector<StrategyChoice> StrategySelector::candidatesLocked(const std::string
     }
 
     if (hasDirect) {
-        out.push_back(std::move(directChoice));
+        if (m_profile->directFirst && !udp) {
+            out.insert(out.begin(), std::move(directChoice));
+        } else {
+            out.push_back(std::move(directChoice));
+        }
     } else {
         StrategyChoice choice;
         choice.owner = m_profile;
         choice.direct = true;
-        out.push_back(std::move(choice));
+        if (m_profile->directFirst && !udp) {
+            out.insert(out.begin(), std::move(choice));
+        } else {
+            out.push_back(std::move(choice));
+        }
     }
 
     return out;

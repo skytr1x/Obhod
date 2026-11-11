@@ -30,7 +30,6 @@ import com.skytr1x.obhod.diagnostics.ConnectivitySelfTest
 import com.skytr1x.obhod.diagnostics.TransferTestConfig
 import com.skytr1x.obhod.logging.AppLog
 import com.skytr1x.obhod.network.NetworkCalibrator
-import com.skytr1x.obhod.proxy.TelegramProxyService
 import com.skytr1x.obhod.strategy.DomainListRepository
 import com.skytr1x.obhod.strategy.StrategyProfiles
 import com.skytr1x.obhod.vpn.ZapretVpnService
@@ -49,7 +48,6 @@ import kotlinx.coroutines.withContext
 class MainActivity : AppCompatActivity() {
     private var starting by mutableStateOf(false)
     private var vpnRunning by mutableStateOf(false)
-    private var telegramRunning by mutableStateOf(false)
     private var selectedStrategyIndex by mutableIntStateOf(0)
     private var updatingDomainList by mutableStateOf(false)
     private var domainListStatus by mutableStateOf("")
@@ -137,11 +135,12 @@ class MainActivity : AppCompatActivity() {
             ObhodTheme {
                 ObhodApp(
                     vpnRunning = vpnRunning,
-                    telegramRunning = telegramRunning,
                     starting = starting,
                     selectedStrategyIndex = selectedStrategyIndex,
                     onStrategySelected = ::selectStrategy,
-                    onToggle = { if (isAnyServiceRunning() || starting) stopObhod() else requestVpnAndStart() },
+                    onToggle = {
+                        if (isServiceActive() || starting) stopObhod() else requestVpnAndStart()
+                    },
                     showTacticHelp = needsTacticHelp,
                     onTacticHelpAccepted = ::acceptTacticHelp,
                     updatingDomainList = updatingDomainList,
@@ -157,13 +156,25 @@ class MainActivity : AppCompatActivity() {
             }
         }
         refreshState()
+        if (savedInstanceState == null) handleQuickSettingsIntent(intent)
         if (savedInstanceState == null) AppLog.i("UI", "Obhod запущен")
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleQuickSettingsIntent(intent)
+    }
+
+    private fun handleQuickSettingsIntent(intent: Intent?) {
+        if (intent?.action != ACTION_START_FROM_TILE) return
+        intent.action = null
+        if (isServiceActive()) stopObhod() else requestVpnAndStart()
     }
 
     override fun onStart() {
         super.onStart()
         val filter = IntentFilter().apply {
-            addAction(TelegramProxyService.ACTION_STATE_CHANGED)
             addAction(ZapretVpnService.ACTION_STATE_CHANGED)
         }
         ContextCompat.registerReceiver(this, stateReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
@@ -384,7 +395,11 @@ class MainActivity : AppCompatActivity() {
             tlsSamples = DiagnosticReport.tlsSampleSummary(currentNetworkMessages),
             selfTest = DiagnosticReport.latestSelfTest(currentNetworkMessages),
             latestFailure = DiagnosticReport.latestFailure(currentNetworkMessages),
-            quicSuppressionCount = DiagnosticReport.quicSuppressionCount(currentNetworkMessages)
+            quicSuppressionCount = DiagnosticReport.quicSuppressionCount(currentNetworkMessages),
+            adaptiveProfileSelected = selectedProfile == StrategyProfiles.ADAPTIVE_ID,
+            adaptiveAttempts = currentNetworkMessages
+                .filter { it.startsWith("[ADAPTIVE]") }
+                .takeLast(20)
         )
         return DiagnosticReport.format(data)
     }
@@ -408,15 +423,15 @@ class MainActivity : AppCompatActivity() {
     private fun appVersionName(): String =
         packageManager.getPackageInfo(packageName, 0).versionName ?: "unknown"
 
-    private fun isAnyServiceRunning(): Boolean =
-        getSharedPreferences("telegram_proxy", MODE_PRIVATE).getBoolean("running", false) ||
-            getSharedPreferences("zapret", MODE_PRIVATE).getBoolean("running", false)
+    private fun isServiceActive(): Boolean {
+        val prefs = getSharedPreferences("zapret", MODE_PRIVATE)
+        return prefs.getBoolean("running", false) || prefs.getBoolean("starting", false)
+    }
 
     private fun refreshState() {
         val zapretPrefs = getSharedPreferences("zapret", MODE_PRIVATE)
-        telegramRunning = getSharedPreferences("telegram_proxy", MODE_PRIVATE)
-            .getBoolean("running", false)
         vpnRunning = zapretPrefs.getBoolean("running", false)
+        starting = zapretPrefs.getBoolean("starting", false)
     }
 
     private fun requestVpnAndStart() {
@@ -447,20 +462,17 @@ class MainActivity : AppCompatActivity() {
             action = ZapretVpnService.ACTION_START
             putExtra(ZapretVpnService.EXTRA_PROFILE, option.id)
         })
-        ContextCompat.startForegroundService(this, Intent(this, TelegramProxyService::class.java).apply {
-            action = TelegramProxyService.ACTION_START
-        })
     }
 
     private fun stopObhod() {
         starting = false
         AppLog.i("UI", "Остановка обхода")
         startService(Intent(this, ZapretVpnService::class.java).setAction(ZapretVpnService.ACTION_STOP))
-        startService(Intent(this, TelegramProxyService::class.java).setAction(TelegramProxyService.ACTION_STOP))
         refreshState()
     }
 
     companion object {
         private const val KEY_TACTIC_HELP_ACCEPTED = "tactic_help_accepted"
+        const val ACTION_START_FROM_TILE = "com.skytr1x.obhod.action.START_FROM_TILE"
     }
 }

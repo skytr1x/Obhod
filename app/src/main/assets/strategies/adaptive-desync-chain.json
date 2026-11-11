@@ -1,0 +1,95 @@
+{
+  "version": 1,
+  "updated": "adaptive-desync-chain",
+  "socks_port": 10800,
+  "default_ttl": 64,
+  "direct_first": true,
+  "adaptive_attempts_per_minute": 12,
+  "max_strategy_attempts": 16,
+  "quic_fallback": true,
+  "defaults": {
+    "tcp": [
+      "direct",
+      "adaptive-p1",
+      "adaptive-p2",
+      "adaptive-p3",
+      "adaptive-p4",
+      "adaptive-p5",
+      "adaptive-p6"
+    ],
+    "udp": ["direct"]
+  },
+  "strategies": [
+    {
+      "id": "adaptive-p1",
+      "cost": 1,
+      "adaptive": true,
+      "tcp": {
+        "actions": [
+          { "type": "tlsrec", "pos": "sni" },
+          { "type": "split", "pos": "sni" }
+        ]
+      }
+    },
+    {
+      "id": "adaptive-p2",
+      "cost": 2,
+      "adaptive": true,
+      "tcp": {
+        "actions": [
+          { "type": "tlsrec", "pos": "sni+1" },
+          { "type": "split", "pos": "sni+1" }
+        ]
+      }
+    },
+    {
+      "id": "adaptive-p3",
+      "cost": 3,
+      "adaptive": true,
+      "tcp": {
+        "actions": [
+          { "type": "tlsrec", "pos": "sni" },
+          { "type": "split", "pos": "sni" },
+          { "type": "split", "pos": "sni+1" }
+        ]
+      }
+    },
+    {
+      "id": "adaptive-p4",
+      "cost": 4,
+      "adaptive": true,
+      "tcp": {
+        "actions": [
+          { "type": "tlsrec", "pos": "sni" },
+          { "type": "split", "pos": "sni" },
+          { "type": "disorder", "pos": "sni+1" }
+        ]
+      }
+    },
+    {
+      "id": "adaptive-p5",
+      "cost": 5,
+      "adaptive": true,
+      "tcp": {
+        "actions": [
+          { "type": "tlsrec", "pos": "sni" },
+          { "type": "split", "pos": "sni" },
+          { "type": "oob", "pos": "sni+1" }
+        ]
+      }
+    },
+    {
+      "id": "adaptive-p6",
+      "cost": 6,
+      "adaptive": true,
+      "tcp": {
+        "actions": [
+          { "type": "tlsrec", "pos": "sni" },
+          { "type": "split", "pos": "sni" },
+          { "type": "split", "pos": "sni+1" },
+          { "type": "disorder", "pos": "sni+2" }
+        ]
+      }
+    }
+  ]
+}

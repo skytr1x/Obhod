@@ -1152,7 +1152,8 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
     std::string cached;
     if (m_selector) cached = m_selector->cachedStrategy(host, strategyScope);
     const bool hostUnavailableCached =
-        m_selector && m_selector->hostUnavailableCached(host, strategyScope);
+        m_selector && !m_selector->adaptiveChainEnabled() &&
+        m_selector->hostUnavailableCached(host, strategyScope);
 
     std::vector<StrategyChoice> candidates;
     if (hostUnavailableCached) {
@@ -1210,8 +1211,8 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
     }
 
     const std::size_t generatedCandidateCount = candidates.size();
-    const std::size_t profileCandidateLimit =
-        static_cast<std::size_t>(kMaxStrategyAttempts);
+    const std::size_t profileCandidateLimit = static_cast<std::size_t>(
+        m_selector ? m_selector->maxStrategyAttempts() : kMaxStrategyAttempts);
     if (candidates.size() > profileCandidateLimit) {
         std::vector<StrategyChoice> limited;
         std::vector<StrategyChoice> extraVariants;
@@ -1502,6 +1503,14 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
          !verified && i < candidates.size(); ++i) {
         const StrategyChoice& choice = candidates[i];
         const std::string strategyId = choice.key();
+        const bool adaptiveAttempt = choice.strategy && choice.strategy->adaptive;
+
+        if (adaptiveAttempt && m_selector &&
+            !m_selector->allowAdaptiveAttempt(host, strategyScope)) {
+            emitEvent("[ADAPTIVE] host=%s profile=%s outcome=rate_limited limit_per_minute",
+                      host.c_str(), strategyId.c_str());
+            continue;
+        }
 
         const int budgetMs = remainingBudget();
         if (budgetMs == 0) {
@@ -1549,6 +1558,11 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
                 emitEvent("[FAIL] %s:%u via %s: reconnect failed: %s",
                           host.c_str(), request.port, strategyId.c_str(),
                           error.c_str());
+                if (adaptiveAttempt) {
+                    emitEvent("[ADAPTIVE] host=%s profile=%s outcome=failed stage=reconnect reason=%s",
+                              host.c_str(), strategyId.c_str(),
+                              eventErrorCategory(error));
+                }
                 lastFailure = error;
                 lastFailureStage = "reconnect";
                 lastSendOk = false;
@@ -1576,6 +1590,10 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
                       connectedIp().c_str(), cachedAttempt ? "cached, " : "",
                       attemptsTried, candidates.size());
         }
+        if (adaptiveAttempt) {
+            emitEvent("[ADAPTIVE] host=%s profile=%s outcome=attempt",
+                      host.c_str(), strategyId.c_str());
+        }
 
         SendOutcome outcome;
         const bool sent = sendFirstPayload(remoteFd, payload, host, choice, outcome);
@@ -1593,6 +1611,11 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
             emitEvent("[FAIL] %s:%u via %s remote_ip=%s: send failed: %s (%ld ms)",
                       host.c_str(), request.port, strategyId.c_str(),
                       connectedIp().c_str(), outcome.error.c_str(), ms);
+            if (adaptiveAttempt) {
+                emitEvent("[ADAPTIVE] host=%s profile=%s outcome=failed stage=send reason=%s",
+                          host.c_str(), strategyId.c_str(),
+                          eventErrorCategory(outcome.error));
+            }
             lastFailure = outcome.error;
             lastFailureStage = "strategy_send";
             SKY_LOGW("SOCKS5: strategy '%s' failed to send: %s",
@@ -1631,6 +1654,10 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
                     std::chrono::steady_clock::now() - responseStart).count());
             emitEvent("[METRIC] kind=tls_success strategy=%s connect_rtt_ms=%d tls_response_ms=%ld",
                       strategyId.c_str(), connectRttMs, tlsResponseMs);
+            if (adaptiveAttempt) {
+                emitEvent("[ADAPTIVE] host=%s profile=%s outcome=success elapsed_ms=%ld",
+                          host.c_str(), strategyId.c_str(), ms);
+            }
             const char* action = "split";
             if (choice.direct) {
                 action = "direct";
@@ -1664,6 +1691,11 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
         emitEvent("[FAIL] %s:%u via %s remote_ip=%s: %s (%ld ms)",
                   host.c_str(), request.port, strategyId.c_str(),
                   connectedIp().c_str(), responseError.c_str(), ms);
+        if (adaptiveAttempt) {
+            emitEvent("[ADAPTIVE] host=%s profile=%s outcome=failed stage=tls_response reason=%s",
+                      host.c_str(), strategyId.c_str(),
+                      eventErrorCategory(responseError));
+        }
         lastFailure = responseError;
         lastFailureStage = "tls_response";
         lastTlsHeaderBytes = tlsHeaderBytes;
@@ -1689,13 +1721,19 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
         return;
     }
 
-    if (!verified && completeClientHello && !directOnly && m_selector) {
+    if (!verified && completeClientHello && !directOnly && m_selector &&
+        !m_selector->adaptiveChainEnabled()) {
         m_selector->markHostUnavailable(host, strategyScope);
     }
 
     if (!verified && completeClientHello && !budgetExhausted && !directOnly) {
         emitEvent("[GIVEUP] %s:%u after %zu attempt(s) (%ld ms)", host.c_str(),
                   request.port, attemptsTried, elapsed());
+    }
+    if (!verified && completeClientHello && !directOnly && m_selector &&
+        m_selector->adaptiveChainEnabled()) {
+        emitEvent("[ADAPTIVE] host=%s outcome=chain_exhausted attempts=%zu reason=%s",
+                  host.c_str(), attemptsTried, eventErrorCategory(lastFailure));
     }
     if (budgetExhausted) {
         lastSendOk = false;

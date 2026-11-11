@@ -78,6 +78,41 @@ class DiagnosticReportTest {
     }
 
     @Test
+    fun reportIncludesAdaptiveAttemptsAndDisclosesDomainNames() {
+        val report = DiagnosticReport.format(
+            DiagnosticReportData(
+                generatedAt = "2026-11-08T19:00:00Z",
+                appVersion = "1",
+                androidVersion = "Android (API 35)",
+                device = "Test device",
+                networkClass = "Wi-Fi",
+                networkValidated = true,
+                networkMetered = false,
+                privateDnsActive = false,
+                ipv6Only = false,
+                calibrationSignal = "unknown",
+                dnsComparison = "unknown",
+                selectedProfile = "list",
+                operatorRegion = "",
+                latestTlsSuccess = null,
+                tlsSamples = TlsSampleSummary(0, 0),
+                selfTest = null,
+                latestFailure = null,
+                quicSuppressionCount = 0,
+                adaptiveProfileSelected = true,
+                adaptiveAttempts = listOf(
+                    "[ADAPTIVE] host=example.test profile=adaptive-p1 outcome=failed stage=tls_response reason=timeout"
+                )
+            )
+        )
+
+        assertTrue(report.contains("Adaptive Desync Chain: профиль выбран"))
+        assertTrue(report.contains("example.test"))
+        assertTrue(report.contains("может содержать доменные имена"))
+        assertFalse(report.contains("не содержит домены"))
+    }
+
+    @Test
     fun includesOptionalOperatorRegionWithoutControlCharacters() {
         val report = DiagnosticReport.format(
             DiagnosticReportData(

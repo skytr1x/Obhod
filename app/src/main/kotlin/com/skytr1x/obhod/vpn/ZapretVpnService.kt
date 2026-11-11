@@ -17,7 +17,8 @@ import com.skytr1x.obhod.network.DnsOverHttpsResolver
 import com.skytr1x.obhod.network.NetworkCalibrator
 import com.skytr1x.obhod.diagnostics.ConnectionFailureClassifier
 import com.skytr1x.obhod.notification.ObhodNotifications
-import com.skytr1x.obhod.proxy.TelegramProxyService
+import com.skytr1x.obhod.proxy.NativeTelegramProxy
+import com.skytr1x.obhod.proxy.TelegramProxyConfig
 import com.skytr1x.obhod.strategy.DomainListRepository
 import com.skytr1x.obhod.strategy.StrategyProfiles
 import java.io.File
@@ -40,11 +41,13 @@ class ZapretVpnService : VpnService(), NativeBridge.Protector, NativeBridge.List
 
     @Volatile private var nativeHandle = 0L
     @Volatile private var vpnInterface: ParcelFileDescriptor? = null
+    @Volatile private var telegramProxyStarted = false
     @Volatile private var starting = false
     @Volatile private var stopRequested = false
     @Volatile private var networkCallbackRegistered = false
     @Volatile private var networkRefreshQueued = false
     @Volatile private var configuredIpv6 = false
+    @Volatile private var adaptiveChainActive = false
     @Volatile private var configuredMtu = 1500
     @Volatile private var configuredNetworkFingerprint = ""
     private var networkChangeGeneration = 0L
@@ -64,6 +67,7 @@ class ZapretVpnService : VpnService(), NativeBridge.Protector, NativeBridge.List
     override fun onCreate() {
         super.onCreate()
         ObhodNotifications.createChannel(this)
+        getSharedPreferences("telegram_proxy", MODE_PRIVATE).edit().clear().apply()
     }
 
     override fun onStartCommand(intent: android.content.Intent?, flags: Int, startId: Int): Int {
@@ -104,7 +108,7 @@ class ZapretVpnService : VpnService(), NativeBridge.Protector, NativeBridge.List
                 .getString("selected_profile", StrategyProfiles.DEFAULT_ID)
             ?: StrategyProfiles.DEFAULT_ID
         stopRequested = false
-        ObhodNotifications.markStarting(this, "zapret")
+        ObhodNotifications.markStarting(this)
         val notification = ObhodNotifications.build(this)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(
@@ -130,22 +134,31 @@ class ZapretVpnService : VpnService(), NativeBridge.Protector, NativeBridge.List
             NativeBridge.load()
             val bundledProfileJson =
                 assets.open("strategies/$profileId.json").bufferedReader().use { it.readText() }
-            val profileJson = try {
+            val baseProfileJson = try {
                 DomainListRepository.applyCachedList(this, profileId, bundledProfileJson)
             } catch (error: Exception) {
                 AppLog.w(TAG, "Кэш списка повреждён; используется список из APK", error)
                 bundledProfileJson
             }
+            adaptiveChainActive = profileId == StrategyProfiles.ADAPTIVE_ID
+            val profileJson = baseProfileJson
             val network = underlyingNetwork()
             val networkKey = currentNetworkKey(network)
             val calibration = NetworkCalibrator.resolve(this, networkKey, network)
-            val tcpOrder = networkTcpOrder(profileJson, calibration.signal)
+            val tcpOrder = if (adaptiveChainActive) {
+                ""
+            } else {
+                networkTcpOrder(profileJson, calibration.signal)
+            }
             AppLog.i(
                 TAG,
                 "Калибровка сети: ${calibration.signal.storageValue}" +
                     if (calibration.fromCache) " (кэш)" else ""
             )
             AppLog.i(TAG, "DNS Discord/system-vs-DoH: ${calibration.dnsComparison.storageValue}")
+            if (adaptiveChainActive) {
+                AppLog.i(TAG, "Adaptive Desync Chain: direct-first, profiles P1–P6, QUIC fallback enabled")
+            }
             logNetworkDetails(calibration.networkDetails)
             AppLog.i(
                 TAG,
@@ -183,7 +196,7 @@ class ZapretVpnService : VpnService(), NativeBridge.Protector, NativeBridge.List
 
             nativeHandle = NativeBridge.create(profileFile.absolutePath, this, this)
             if (nativeHandle == 0L) error("Не удалось создать нативный движок")
-            NativeBridge.setNetworkKey(nativeHandle, networkKey)
+            NativeBridge.setNetworkKey(nativeHandle, strategyNetworkKey(networkKey))
             NativeBridge.setNetworkStrategyOrder(nativeHandle, tcpOrder)
             NativeBridge.start(nativeHandle)
             val coreStats = NativeBridge.getStatsJson(nativeHandle) ?: error("Нативный движок не вернул состояние")
@@ -213,7 +226,18 @@ misc:
             if (!NativeBridge.startTunnel(vpnInterface!!.fd, tunnelConfig.absolutePath)) {
                 error("Не удалось запустить tun2socks")
             }
-            AppLog.i(TAG, "TUN и SOCKS5 готовы: ${StrategyProfiles.label(profileId)}")
+            val telegramResult = NativeTelegramProxy.start(
+                TelegramProxyConfig.HOST,
+                TelegramProxyConfig.PORT,
+                TelegramProxyConfig.getOrCreateSecret(this),
+                cacheDir.absolutePath
+            )
+            if (telegramResult != 0) error("Не удалось запустить MTProxy ($telegramResult)")
+            telegramProxyStarted = true
+            AppLog.i(
+                TAG,
+                "TUN, SOCKS5 и MTProxy готовы: ${StrategyProfiles.label(profileId)}"
+            )
             publishState(true, profileId)
             configuredNetworkFingerprint = currentUnderlyingNetworkFingerprint()
             registerNetworkCallback()
@@ -238,6 +262,11 @@ misc:
     }
 
     private fun releaseNativeAndVpn() {
+        if (telegramProxyStarted) {
+            runCatching { NativeTelegramProxy.stop() }
+                .onFailure { AppLog.w(TAG, "Не удалось остановить MTProxy", it) }
+            telegramProxyStarted = false
+        }
         synchronized(nativeLock) {
             if (NativeBridge.isLoaded()) {
                 runCatching { NativeBridge.stopTunnel() }.onFailure { AppLog.w(TAG, "Не удалось остановить tun2socks", it) }
@@ -388,6 +417,9 @@ misc:
         }
         return "wifi_" + sha1(material).take(12)
     }
+
+    private fun strategyNetworkKey(networkKey: String): String =
+        if (adaptiveChainActive) "${networkKey}_adaptive" else networkKey
 
     private fun networkTcpOrder(
         profileJson: String,
@@ -564,7 +596,7 @@ misc:
             synchronized(nativeLock) {
                 val handle = nativeHandle
                 if (handle == 0L || !NativeBridge.isLoaded()) return
-                NativeBridge.setNetworkKey(handle, networkKey)
+                NativeBridge.setNetworkKey(handle, strategyNetworkKey(networkKey))
                 NativeBridge.setNetworkStrategyOrder(handle, tcpOrder)
                 NativeBridge.stop(handle)
                 NativeBridge.start(handle)

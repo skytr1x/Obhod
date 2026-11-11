@@ -8,6 +8,7 @@ data class StrategyProfileOption(
 
 object StrategyProfiles {
     const val DEFAULT_ID = "list"
+    const val ADAPTIVE_ID = "adaptive-desync-chain"
 
     val options = listOf(
         StrategyProfileOption(
@@ -34,6 +35,11 @@ object StrategyProfiles {
             "split-sni-mobile",
             "Split SNI",
             "Сначала разрез перед SNI, затем разрез после первого байта. Без fake-пакетов TCP."
+        ),
+        StrategyProfileOption(
+            ADAPTIVE_ID,
+            "Adaptive Desync Chain",
+            "Комбинация из нескольких профилей с адаптацией."
         )
     )
 

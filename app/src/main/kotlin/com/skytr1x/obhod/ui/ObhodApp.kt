@@ -107,7 +107,6 @@ private enum class ObhodTab(val label: String, val icon: Int) {
 @Composable
 internal fun ObhodApp(
     vpnRunning: Boolean,
-    telegramRunning: Boolean,
     starting: Boolean,
     selectedStrategyIndex: Int,
     onStrategySelected: (Int) -> Unit,
@@ -165,7 +164,6 @@ internal fun ObhodApp(
                 when (selectedTab) {
                     ObhodTab.Home -> HomeScreen(
                         vpnRunning = vpnRunning,
-                        telegramRunning = telegramRunning,
                         starting = starting,
                         selectedStrategyIndex = selectedStrategyIndex,
                         onStrategySelected = onStrategySelected,
@@ -349,7 +347,6 @@ private fun ObhodNavigationBar(selected: Int, onSelect: (Int) -> Unit) {
 @Composable
 private fun HomeScreen(
     vpnRunning: Boolean,
-    telegramRunning: Boolean,
     starting: Boolean,
     selectedStrategyIndex: Int,
     onStrategySelected: (Int) -> Unit,
@@ -359,10 +356,10 @@ private fun HomeScreen(
     batteryOptimizationIgnored: Boolean,
     onRequestBatteryOptimization: () -> Unit,
     onToggle: () -> Unit,
-    onCopyText: (String) -> Unit
+    onCopyText: (String) -> Unit,
 ) {
     var showProxyDialog by rememberSaveable { mutableStateOf(false) }
-    val running = vpnRunning || telegramRunning
+    val running = vpnRunning
 
     Column(
         Modifier
@@ -384,7 +381,6 @@ private fun HomeScreen(
         Spacer(Modifier.height(24.dp))
         StatusCard(
             vpnRunning = vpnRunning,
-            telegramRunning = telegramRunning,
             starting = starting,
             onToggle = onToggle,
             onOpenProxy = { showProxyDialog = true }
@@ -419,6 +415,7 @@ private fun HomeScreen(
             onCopyText = onCopyText
         )
     }
+
 }
 
 @Composable
@@ -492,12 +489,11 @@ private fun BatterySettingsCard(
 @Composable
 private fun StatusCard(
     vpnRunning: Boolean,
-    telegramRunning: Boolean,
     starting: Boolean,
     onToggle: () -> Unit,
     onOpenProxy: () -> Unit
 ) {
-    val running = vpnRunning || telegramRunning
+    val running = vpnRunning
     val container = if (running) {
         MaterialTheme.colorScheme.primary
     } else {
@@ -512,14 +508,12 @@ private fun StatusCard(
     val buttonContent = if (running) container else MaterialTheme.colorScheme.onPrimary
     val title = when {
         starting -> "Запуск обхода…"
-        vpnRunning && telegramRunning -> "Обход включен"
-        running -> "Работает один из режимов"
+        running -> "Обход включен"
         else -> "Обход выключен"
     }
     val subtitle = when {
         starting -> "Старт системы..."
-        vpnRunning && telegramRunning -> "Обход успешно включился"
-        running -> "Второй режим пока не запустился"
+        running -> "Системный обход и MTProxy работают"
         else -> "Выберите стратегию и включите обход"
     }
 
@@ -625,7 +619,20 @@ private fun StrategySelector(
     onUpdateDomainList: () -> Unit
 ) {
     var expanded by remember { mutableStateOf(false) }
+    var showAdaptiveWarning by remember { mutableStateOf(false) }
+    var pendingProfileIndex by remember { mutableIntStateOf(-1) }
+    var acceptCountdown by remember { mutableIntStateOf(3) }
     val selected = options[selectedIndex]
+
+    LaunchedEffect(showAdaptiveWarning) {
+        if (showAdaptiveWarning) {
+            acceptCountdown = 3
+            repeat(3) {
+                delay(1_000)
+                acceptCountdown -= 1
+            }
+        }
+    }
 
     // dropdown menu
     ExposedDropdownMenuBox(
@@ -652,7 +659,13 @@ private fun StrategySelector(
                 DropdownMenuItem(
                     text = { Text(option.title, style = MaterialTheme.typography.titleSmall) },
                     onClick = {
-                        onSelected(index)
+                        if (option.id == StrategyProfiles.ADAPTIVE_ID) {
+                            pendingProfileIndex = index
+                            acceptCountdown = 3
+                            showAdaptiveWarning = true
+                        } else {
+                            onSelected(index)
+                        }
                         expanded = false
                     },
                     leadingIcon = {
@@ -706,6 +719,47 @@ private fun StrategySelector(
             text = "Стратегию можно сменить после выключения",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+    if (showAdaptiveWarning) {
+        AlertDialog(
+            onDismissRequest = {
+                showAdaptiveWarning = false
+                pendingProfileIndex = -1
+            },
+            title = { Text("Экспериментальная тактика") },
+            text = {
+                Text(
+                    "Данная тактика является эксперементальной и в какой-то мере запасным вариантом. " +
+                        "Используя эту тактику (на момент 1.5) стабильность быстрого и нормального " +
+                        "трафика далеко не гарантирована.",
+                    style = MaterialTheme.typography.bodyLarge
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = acceptCountdown == 0,
+                    onClick = {
+                        if (pendingProfileIndex >= 0 && acceptCountdown == 0) {
+                            onSelected(pendingProfileIndex)
+                            showAdaptiveWarning = false
+                            pendingProfileIndex = -1
+                        }
+                    }
+                ) {
+                    Text(if (acceptCountdown == 0) "Принять" else "Принять ($acceptCountdown)")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        showAdaptiveWarning = false
+                        pendingProfileIndex = -1
+                    }
+                ) {
+                    Text("Отмена")
+                }
+            }
         )
     }
 }

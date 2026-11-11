@@ -393,6 +393,11 @@ std::shared_ptr<Profile> parseProfile(const std::string& text, std::string& erro
     profile->directRu = getBool(&root, "direct_ru", true);
     profile->delayMs = getInt(&root, "delay_ms", 0);
     profile->quicFallback = getBool(&root, "quic_fallback", true);
+    profile->directFirst = getBool(&root, "direct_first", false);
+    profile->adaptiveAttemptsPerMinute =
+        std::clamp(getInt(&root, "adaptive_attempts_per_minute", 0), 0, 60);
+    profile->maxStrategyAttempts =
+        std::clamp(getInt(&root, "max_strategy_attempts", 10), 1, 16);
 
     const JsonValue* routing = root.find("routing");
     if (routing) {
@@ -439,6 +444,7 @@ std::shared_ptr<Profile> parseProfile(const std::string& text, std::string& erro
                 strategy.id = "strategy-" + std::to_string(profile->strategies.size());
             }
             strategy.cost = getInt(&item, "cost", 10);
+            strategy.adaptive = getBool(&item, "adaptive", false);
             strategy.tunnel = getString(&item, "action", "") == "tunnel";
             strategy.direct = getString(&item, "action", "") == "direct";
 

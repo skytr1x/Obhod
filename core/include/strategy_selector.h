@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -44,12 +45,15 @@ public:
                      long latencyMs = -1, const std::string& scope = std::string());
     void markFailure(const std::string& host, const std::string& strategyId,
                      const std::string& scope = std::string());
+    bool allowAdaptiveAttempt(const std::string& host, const std::string& scope);
     void markHostUnavailable(const std::string& host, const std::string& scope);
     bool hostUnavailableCached(const std::string& host, const std::string& scope) const;
 
     void setCachePath(const std::string& basePath);
     std::size_t setNetworkKey(const std::string& networkKey);
     void setNetworkStrategyOrder(const std::string& tcpOrder);
+    int maxStrategyAttempts() const;
+    bool adaptiveChainEnabled() const;
 
     std::string cachedStrategy(const std::string& host,
                                const std::string& scope = std::string()) const;
@@ -73,6 +77,9 @@ private:
     std::shared_ptr<Profile> m_profile;
     mutable std::mutex m_mutex;
     mutable std::unordered_map<std::string, HostState> m_cache;
+    std::unordered_map<std::string,
+                       std::deque<std::chrono::steady_clock::time_point>>
+        m_adaptiveAttempts;
     std::string m_cacheBasePath;
     std::string m_networkKey = "default";
     std::vector<std::string> m_networkTcpOrder;

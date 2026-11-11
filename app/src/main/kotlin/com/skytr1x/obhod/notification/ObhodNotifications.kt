@@ -9,7 +9,6 @@ import android.content.Intent
 import androidx.core.app.NotificationCompat
 import androidx.core.graphics.drawable.IconCompat
 import com.skytr1x.obhod.R
-import com.skytr1x.obhod.proxy.TelegramProxyService
 import com.skytr1x.obhod.ui.MainActivity
 import com.skytr1x.obhod.vpn.ZapretVpnService
 
@@ -21,15 +20,12 @@ object ObhodNotifications {
     const val NOTIFICATION_ID = 42
 
     private const val VPN_PREFS = "zapret"
-    private const val TELEGRAM_PREFS = "telegram_proxy"
 
     private object Text {
         const val CHANNEL_NAME = "Обход"
         const val TITLE = "Обход"
         const val STOP_ACTION_LABEL = "Выключить обход"
-        const val BOTH_RUNNING = "Системный обход работает"
-        const val VPN_RUNNING = "Работает системный обход"
-        const val TELEGRAM_RUNNING = "Работает прокси"
+        const val RUNNING = "Системный обход и MTProxy работают"
         const val STARTING = "Запуск обхода…"
         const val STOPPING = "Остановка обхода…"
     }
@@ -45,11 +41,12 @@ object ObhodNotifications {
         manager.cancel(LEGACY_TELEGRAM_NOTIFICATION_ID)
     }
 
-    fun markStarting(context: Context, preferencesName: String) {
-        context.getSharedPreferences(preferencesName, Context.MODE_PRIVATE)
+    fun markStarting(context: Context) {
+        context.getSharedPreferences(VPN_PREFS, Context.MODE_PRIVATE)
             .edit()
             .putBoolean("starting", true)
             .apply()
+        ObhodTileService.requestUpdate(context)
     }
 
     fun build(context: Context) = NotificationCompat.Builder(context, CHANNEL_ID)
@@ -79,27 +76,19 @@ object ObhodNotifications {
 
     fun refresh(context: Context) {
         val vpnPrefs = context.getSharedPreferences(VPN_PREFS, Context.MODE_PRIVATE)
-        val telegramPrefs = context.getSharedPreferences(TELEGRAM_PREFS, Context.MODE_PRIVATE)
         val hasActiveService = vpnPrefs.getBoolean("running", false) ||
-            telegramPrefs.getBoolean("running", false) ||
-            vpnPrefs.getBoolean("starting", false) ||
-            telegramPrefs.getBoolean("starting", false)
+            vpnPrefs.getBoolean("starting", false)
         val manager = context.getSystemService(NotificationManager::class.java)
         if (hasActiveService) manager.notify(NOTIFICATION_ID, build(context))
         else manager.cancel(NOTIFICATION_ID)
+        ObhodTileService.requestUpdate(context)
     }
 
     private fun statusText(context: Context): String {
         val vpnPrefs = context.getSharedPreferences(VPN_PREFS, Context.MODE_PRIVATE)
-        val telegramPrefs = context.getSharedPreferences(TELEGRAM_PREFS, Context.MODE_PRIVATE)
-        val vpnRunning = vpnPrefs.getBoolean("running", false)
-        val telegramRunning = telegramPrefs.getBoolean("running", false)
         return when {
-            vpnRunning && telegramRunning -> Text.BOTH_RUNNING
-            vpnRunning -> Text.VPN_RUNNING
-            telegramRunning -> Text.TELEGRAM_RUNNING
-            vpnPrefs.getBoolean("starting", false) || telegramPrefs.getBoolean("starting", false) ->
-                Text.STARTING
+            vpnPrefs.getBoolean("running", false) -> Text.RUNNING
+            vpnPrefs.getBoolean("starting", false) -> Text.STARTING
             else -> Text.STOPPING
         }
     }
@@ -122,10 +111,6 @@ class StopObhodReceiver : BroadcastReceiver() {
         context.startService(
             Intent(context, ZapretVpnService::class.java)
                 .setAction(ZapretVpnService.ACTION_STOP)
-        )
-        context.startService(
-            Intent(context, TelegramProxyService::class.java)
-                .setAction(TelegramProxyService.ACTION_STOP)
         )
     }
 }

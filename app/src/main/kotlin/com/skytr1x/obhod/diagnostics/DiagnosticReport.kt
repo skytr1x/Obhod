@@ -32,7 +32,9 @@ internal data class DiagnosticReportData(
     val tlsSamples: TlsSampleSummary,
     val selfTest: TransferTestSummary?,
     val latestFailure: FailureFinding?,
-    val quicSuppressionCount: Int
+    val quicSuppressionCount: Int,
+    val adaptiveProfileSelected: Boolean = false,
+    val adaptiveAttempts: List<String> = emptyList()
 )
 
 internal object DiagnosticReport {
@@ -93,6 +95,18 @@ internal object DiagnosticReport {
         appendLine("Сравнение DNS: ${data.dnsComparison.reportSafe()}")
         appendLine("Интерпретация DNS: ${dnsInterpretation(data.dnsComparison)}")
         appendLine("Выбранный профиль: ${data.selectedProfile.reportSafe()}")
+        appendLine(
+            "Adaptive Desync Chain: " +
+                if (data.adaptiveProfileSelected) "профиль выбран" else "профиль не выбран"
+        )
+        if (data.adaptiveAttempts.isNotEmpty()) {
+            appendLine("Последние попытки Adaptive Desync Chain:")
+            data.adaptiveAttempts.takeLast(20).forEach { attempt ->
+                appendLine("  ${attempt.reportSafe()}")
+            }
+        } else {
+            appendLine("Попытки Adaptive Desync Chain: нет данных")
+        }
         val operatorRegion = data.operatorRegion
             .filterNot(Char::isISOControl)
             .trim()
@@ -160,7 +174,14 @@ internal object DiagnosticReport {
         }
         appendLine()
         appendLine("Отчёт создаётся только по запросу и сохраняется в выбранное вами место.")
-        appendLine("Он не содержит домены, IP-адреса, SSID или содержимое трафика и не отправляется автоматически.")
+        appendLine(
+            if (data.adaptiveAttempts.isNotEmpty()) {
+                "При включённой адаптивной тактике отчёт может содержать доменные имена и исходы попыток; " +
+                    "он не содержит IP-адреса или содержимое трафика и не отправляется автоматически."
+            } else {
+                "Отчёт не содержит домены, IP-адреса, SSID или содержимое трафика и не отправляется автоматически."
+            }
+        )
         appendLine("Разные DNS-ответы и неудачный TLS-пробник сами по себе не доказывают подмену DNS или тип блокировки.")
         appendLine("Эта статистика относится только к проверкам стратегий с полным ClientHello, а не к завершённым соединениям приложения.")
         appendLine("Время до ServerHello не является подтверждением завершённого TLS-handshake.")

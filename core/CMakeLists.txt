@@ -73,6 +73,19 @@ if(BUILD_TESTING AND NOT ANDROID)
         SKY_LIST_PROFILE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../app/src/main/assets/strategies/list.json"
     )
     add_test(NAME list_strategy_routing COMMAND strategy_selector_test)
+
+    add_executable(adaptive_desync_test
+        tests/adaptive_desync_test.cpp
+        src/strategy/profile.cpp
+        src/strategy/strategy_selector.cpp
+        src/util/host_list.cpp
+        src/util/json.cpp
+    )
+    target_compile_definitions(adaptive_desync_test PRIVATE
+        SKY_HOST_BUILD=1
+        SKY_ADAPTIVE_PROFILE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../app/src/main/assets/strategies/adaptive-desync-chain.json"
+    )
+    add_test(NAME adaptive_desync_routing COMMAND adaptive_desync_test)
 endif()
 
 target_compile_definitions(skycore PRIVATE _GNU_SOURCE=1)
