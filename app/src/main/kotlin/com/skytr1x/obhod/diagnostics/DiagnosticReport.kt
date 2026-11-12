@@ -34,7 +34,25 @@ internal data class DiagnosticReportData(
     val latestFailure: FailureFinding?,
     val quicSuppressionCount: Int,
     val adaptiveProfileSelected: Boolean = false,
-    val adaptiveAttempts: List<String> = emptyList()
+    val adaptiveAttempts: List<String> = emptyList(),
+    val logs: List<String> = emptyList()
+)
+
+internal data class AdaptiveHostSummary(
+    val host: String,
+    val steps: List<String>,
+    val succeeded: Boolean,
+    val finalReason: String?
+)
+
+internal data class AdaptiveSummary(
+    val hosts: List<AdaptiveHostSummary>,
+    val winCounts: List<Pair<String, Int>>,
+    val attemptedHosts: Int,
+    val succeededHosts: Int,
+    val p50Ms: Long?,
+    val p95Ms: Long?,
+    val possibleIpFilteringHosts: Int
 )
 
 internal object DiagnosticReport {
@@ -64,6 +82,87 @@ internal object DiagnosticReport {
 
     fun quicSuppressionCount(messages: List<String>): Int =
         messages.count { it.startsWith("[UDP-QUIC-BLOCK]") }
+
+    fun adaptiveSummary(messages: List<String>): AdaptiveSummary {
+        class MutableHost {
+            val steps = mutableListOf<String>()
+            var succeeded = false
+            var finalReason: String? = null
+            var connectIssue = false
+        }
+
+        val hosts = LinkedHashMap<String, MutableHost>()
+        val winCounts = mutableMapOf<String, Int>()
+        val successTimes = mutableListOf<Long>()
+
+        messages.forEach { message ->
+            val fields = adaptiveFields(message) ?: return@forEach
+            val host = fields["host"]?.takeIf { it.isNotBlank() } ?: return@forEach
+            val item = hosts.getOrPut(host) { MutableHost() }
+            val profile = fields["profile"]
+            val reason = fields["reason"]
+            when (fields["outcome"]) {
+                "attempt" -> if (profile != null) item.steps += profile
+                "success" -> {
+                    if (profile != null) {
+                        item.steps += "$profile (ok)"
+                        winCounts[profile] = (winCounts[profile] ?: 0) + 1
+                    }
+                    item.succeeded = true
+                    item.finalReason = null
+                    fields["elapsed_ms"]?.toLongOrNull()?.let(successTimes::add)
+                }
+                "failed" -> {
+                    item.steps += "${profile ?: "?"} (${reason ?: "unknown"})"
+                    item.finalReason = reason
+                    if (fields["stage"] == "connect" &&
+                        (reason == "timeout" || reason == "connection_reset")
+                    ) {
+                        item.connectIssue = true
+                    }
+                }
+                "chain_exhausted" -> item.finalReason = reason ?: item.finalReason
+                "handoff" -> if (profile != null) item.steps += "$profile (handoff)"
+                "rate_limited" -> if (profile != null) item.steps += "$profile (rate_limited)"
+            }
+        }
+
+        val summaries = hosts.map { (host, item) ->
+            AdaptiveHostSummary(host, item.steps, item.succeeded, item.finalReason)
+        }
+        return AdaptiveSummary(
+            hosts = summaries,
+            winCounts = winCounts.entries
+                .sortedWith(compareByDescending<Map.Entry<String, Int>> { it.value }.thenBy { it.key })
+                .map { it.key to it.value },
+            attemptedHosts = hosts.values.count { it.succeeded || it.finalReason != null },
+            succeededHosts = hosts.values.count { it.succeeded },
+            p50Ms = percentile(successTimes, 50),
+            p95Ms = percentile(successTimes, 95),
+            possibleIpFilteringHosts = hosts.values.count {
+                !it.succeeded && it.connectIssue
+            }
+        )
+    }
+
+    private fun adaptiveFields(message: String): Map<String, String>? {
+        if (!message.startsWith("[ADAPTIVE] ")) return null
+        return message.removePrefix("[ADAPTIVE] ").trim()
+            .split(Regex("\\s+"))
+            .mapNotNull { token ->
+                val separator = token.indexOf('=')
+                if (separator <= 0) null
+                else token.substring(0, separator) to token.substring(separator + 1)
+            }
+            .toMap()
+    }
+
+    private fun percentile(values: List<Long>, percent: Int): Long? {
+        if (values.isEmpty()) return null
+        val sorted = values.sorted()
+        val rank = ((percent / 100.0) * sorted.size).toInt().coerceAtLeast(1)
+        return sorted[rank.coerceAtMost(sorted.size) - 1]
+    }
 
     fun latestSelfTest(messages: List<String>): TransferTestSummary? {
         val startIndex = messages.indexOfLast { selfTestStartPattern.matches(it) }
@@ -99,10 +198,51 @@ internal object DiagnosticReport {
             "Adaptive Desync Chain: " +
                 if (data.adaptiveProfileSelected) "профиль выбран" else "профиль не выбран"
         )
+        if (data.adaptiveProfileSelected || data.adaptiveAttempts.isNotEmpty()) {
+            appendLine(
+                "Причины в журнале тактики — это симптомы, а не диагноз: таймаут или сброс " +
+                    "не подтверждают DPI, IP-блокировку или DNS-подмену. IP-блокировки эта тактика не решает."
+            )
+        }
         if (data.adaptiveAttempts.isNotEmpty()) {
-            appendLine("Последние попытки Adaptive Desync Chain:")
-            data.adaptiveAttempts.takeLast(20).forEach { attempt ->
-                appendLine("  ${attempt.reportSafe()}")
+            val adaptive = adaptiveSummary(data.adaptiveAttempts)
+            appendLine("Adaptive Desync Chain по доменам:")
+            if (adaptive.hosts.isEmpty()) {
+                appendLine("  нет данных")
+            } else {
+                adaptive.hosts.forEach { host ->
+                    val outcome = when {
+                        host.succeeded -> "успех"
+                        host.finalReason != null -> "исчерпано: ${host.finalReason}"
+                        else -> "нет итога"
+                    }
+                    val steps = host.steps.joinToString(" -> ").ifBlank { "нет шагов" }
+                    appendLine("  ${host.host.reportSafe()}: ${steps.reportSafe()} => $outcome")
+                }
+                appendLine(
+                    "Победы профилей: " +
+                        adaptive.winCounts.joinToString(", ") { "${it.first} ${it.second}" }
+                            .ifBlank { "нет" }
+                )
+                val attempted = adaptive.attemptedHosts
+                if (attempted > 0) {
+                    val percent = adaptive.succeededHosts * 100 / attempted
+                    appendLine(
+                        "Success rate по доменам: " +
+                            "${adaptive.succeededHosts}/$attempted ($percent%)"
+                    )
+                } else {
+                    appendLine("Success rate по доменам: нет завершённых переборов")
+                }
+                appendLine(
+                    "Время до успеха: p50 ${adaptive.p50Ms?.let { "$it ms" } ?: "нет данных"}, " +
+                        "p95 ${adaptive.p95Ms?.let { "$it ms" } ?: "нет данных"}"
+                )
+                appendLine(
+                    "Возможная IP-фильтрация (таймаут или RST на connect): " +
+                        "${adaptive.possibleIpFilteringHosts} из ${adaptive.hosts.size} доменов; " +
+                        "это не доказательство."
+                )
             }
         } else {
             appendLine("Попытки Adaptive Desync Chain: нет данных")
@@ -113,6 +253,11 @@ internal object DiagnosticReport {
             .take(80)
             .ifBlank { "не указан" }
         appendLine("Оператор / регион: $operatorRegion")
+        appendLine(
+            "Предупреждение: оператор и регион указаны вручную и могут быть неточными. " +
+                "Вместе с журналом эти данные помогают идентифицировать вашу сеть, поэтому " +
+                "просмотрите файл перед отправкой."
+        )
         appendLine(
             "В проверках стратегий ServerHello наблюдался: " +
                 "${data.tlsSamples.serverHelloObserved}; не наблюдался: " +
@@ -175,9 +320,10 @@ internal object DiagnosticReport {
         appendLine()
         appendLine("Отчёт создаётся только по запросу и сохраняется в выбранное вами место.")
         appendLine(
-            if (data.adaptiveAttempts.isNotEmpty()) {
-                "При включённой адаптивной тактике отчёт может содержать доменные имена и исходы попыток; " +
-                    "он не содержит IP-адреса или содержимое трафика и не отправляется автоматически."
+            if (data.adaptiveAttempts.isNotEmpty() || data.logs.isNotEmpty()) {
+                "При включённой адаптивной тактике или приложенном журнале отчёт может содержать " +
+                    "доменные имена, IP-адреса и параметры соединений; содержимое трафика не " +
+                    "записывается и отчёт не отправляется автоматически."
             } else {
                 "Отчёт не содержит домены, IP-адреса, SSID или содержимое трафика и не отправляется автоматически."
             }
@@ -186,6 +332,11 @@ internal object DiagnosticReport {
         appendLine("Эта статистика относится только к проверкам стратегий с полным ClientHello, а не к завершённым соединениям приложения.")
         appendLine("Время до ServerHello не является подтверждением завершённого TLS-handshake.")
         appendLine("Пропускная способность измеряется только самотестом для четырёх фиксированных HTTPS-сервисов.")
+        if (data.logs.isNotEmpty()) {
+            appendLine()
+            appendLine("Журнал приложения (${data.logs.size} записей):")
+            data.logs.forEach { appendLine(it.logSafe()) }
+        }
     }
 
     private fun parseTlsSuccess(message: String): TlsSuccessMetric? {
@@ -237,6 +388,11 @@ internal object DiagnosticReport {
 
     private fun String.reportSafe(): String =
         filterNot(Char::isISOControl).take(160)
+
+    // Log lines keep their detail (up to the AppLog message cap) but lose newlines
+    // so the exported file stays one entry per line.
+    private fun String.logSafe(): String =
+        filterNot(Char::isISOControl).take(2000)
 
     private fun Boolean?.asText(): String = when (this) {
         true -> "да"

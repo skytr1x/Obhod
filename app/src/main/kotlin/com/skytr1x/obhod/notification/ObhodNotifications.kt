@@ -3,18 +3,13 @@ package com.skytr1x.obhod.notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
-import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import androidx.core.app.NotificationCompat
-import androidx.core.graphics.drawable.IconCompat
 import com.skytr1x.obhod.R
 import com.skytr1x.obhod.ui.MainActivity
-import com.skytr1x.obhod.vpn.ZapretVpnService
 
 object ObhodNotifications {
-    private const val ACTION_STOP_ALL = "com.skytr1x.obhod.notification.STOP_ALL"
-    private const val STOP_REQUEST_CODE = 7020
     private const val LEGACY_TELEGRAM_NOTIFICATION_ID = 41
     const val CHANNEL_ID = "obhod_status"
     const val NOTIFICATION_ID = 42
@@ -24,7 +19,6 @@ object ObhodNotifications {
     private object Text {
         const val CHANNEL_NAME = "Обход"
         const val TITLE = "Обход"
-        const val STOP_ACTION_LABEL = "Выключить обход"
         const val RUNNING = "Системный обход и MTProxy работают"
         const val STARTING = "Запуск обхода…"
         const val STOPPING = "Остановка обхода…"
@@ -65,13 +59,6 @@ object ObhodNotifications {
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
         )
-        .addAction(
-            NotificationCompat.Action.Builder(
-                IconCompat.createWithResource(context, R.drawable.ic_stop),
-                Text.STOP_ACTION_LABEL,
-                stopAllPendingIntent(context)
-            ).build()
-        )
         .build()
 
     fun refresh(context: Context) {
@@ -91,26 +78,5 @@ object ObhodNotifications {
             vpnPrefs.getBoolean("starting", false) -> Text.STARTING
             else -> Text.STOPPING
         }
-    }
-
-    private fun stopAllPendingIntent(context: Context): PendingIntent =
-        PendingIntent.getBroadcast(
-            context,
-            STOP_REQUEST_CODE,
-            Intent(context, StopObhodReceiver::class.java).setAction(ACTION_STOP_ALL),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
-    internal fun isStopAllAction(action: String?): Boolean = action == ACTION_STOP_ALL
-}
-
-class StopObhodReceiver : BroadcastReceiver() {
-    override fun onReceive(context: Context, intent: Intent) {
-        if (!ObhodNotifications.isStopAllAction(intent.action)) return
-
-        context.startService(
-            Intent(context, ZapretVpnService::class.java)
-                .setAction(ZapretVpnService.ACTION_STOP)
-        )
     }
 }

@@ -107,6 +107,8 @@ class DiagnosticReportTest {
         )
 
         assertTrue(report.contains("Adaptive Desync Chain: профиль выбран"))
+        assertTrue(report.contains("таймаут или сброс не подтверждают DPI, IP-блокировку или DNS-подмену"))
+        assertTrue(report.contains("IP-блокировки эта тактика не решает"))
         assertTrue(report.contains("example.test"))
         assertTrue(report.contains("может содержать доменные имена"))
         assertFalse(report.contains("не содержит домены"))

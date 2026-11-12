@@ -4,6 +4,7 @@
   "socks_port": 10800,
   "default_ttl": 64,
   "direct_first": true,
+  "adaptive_chain": true,
   "adaptive_attempts_per_minute": 12,
   "max_strategy_attempts": 16,
   "quic_fallback": true,
@@ -90,6 +91,22 @@
           { "type": "disorder", "pos": "sni+2" }
         ]
       }
+    },
+    {
+      "id": "adaptive-http-b7",
+      "cost": 1,
+      "adaptive": true,
+      "tcp": {
+        "actions": [
+          { "type": "split", "pos": "host" },
+          { "type": "split", "pos": "host_end" }
+        ]
+      }
+    },
+    {
+      "id": "direct",
+      "cost": 99,
+      "action": "direct"
     }
   ]
 }

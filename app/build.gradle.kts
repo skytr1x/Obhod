@@ -173,4 +173,5 @@ dependencies {
     implementation("androidx.compose.material3:material3:1.4.0")
     implementation("net.java.dev.jna:jna:5.14.0@aar")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }

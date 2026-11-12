@@ -117,13 +117,16 @@ private:
                           const std::string& host, const StrategyChoice& choice,
                           SendOutcome& outcome);
     bool waitForResponse(int fd, int timeoutMs, bool& readable,
-                         std::size_t& tlsHeaderBytes, std::string& error);
+                         std::size_t& tlsHeaderBytes, std::string& error,
+                         bool expectHttp = false);
     void relay(int clientFd, int remoteFd, const std::string& host = {},
                uint16_t port = 0, bool reportStream = false, int idleTimeoutMs = 0);
 
     bool createRemoteUdp(const std::string& host, uint16_t port, UdpPeer& peer,
                          std::string& error);
     void relayUdp(int clientFd, int relayFd);
+    bool isInDesyncScope(const std::string& host);
+    void recordScopedAnswers(const std::vector<std::uint8_t>& response);
 
     int m_listenFd = -1;
     uint16_t m_port = 0;
@@ -141,6 +144,8 @@ private:
     std::thread m_acceptThread;
     std::mutex m_connectionMutex;
     std::set<int> m_connections;
+    std::mutex m_scopeMutex;
+    std::map<std::string, std::chrono::steady_clock::time_point> m_scopedIps;
     std::mutex m_dnsMutex;
     std::condition_variable m_dnsCondition;
     std::deque<DnsWork> m_dnsQueue;

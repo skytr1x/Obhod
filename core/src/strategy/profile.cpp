@@ -394,6 +394,7 @@ std::shared_ptr<Profile> parseProfile(const std::string& text, std::string& erro
     profile->delayMs = getInt(&root, "delay_ms", 0);
     profile->quicFallback = getBool(&root, "quic_fallback", true);
     profile->directFirst = getBool(&root, "direct_first", false);
+    profile->adaptiveChain = getBool(&root, "adaptive_chain", false);
     profile->adaptiveAttemptsPerMinute =
         std::clamp(getInt(&root, "adaptive_attempts_per_minute", 0), 0, 60);
     profile->maxStrategyAttempts =
@@ -616,4 +617,4 @@ std::shared_ptr<Profile> defaultProfile() {
     return profile;
 }
 
-} // namespace skyunblock
+}

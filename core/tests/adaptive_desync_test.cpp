@@ -45,10 +45,30 @@ int main() {
         return 1;
     }
 
+    const auto httpB7 = selector.findStrategy("adaptive-http-b7");
+    if (!require(httpB7.strategy && httpB7.strategy->tcp.actions.size() == 2,
+                 "HTTP technique B7 must be configured in the adaptive profile")) {
+        return 1;
+    }
+
+    // simulate the runtime merge with the selected base profile
+    profile->include.add("blocked.example");
+    skyunblock::StrategyDef handoff;
+    handoff.id = "list-handoff";
+    handoff.cost = 7;
+    handoff.tcp.valid = true;
+    skyunblock::TcpAction handoffAction;
+    handoffAction.type = skyunblock::ActionType::SPLIT;
+    handoffAction.pos = "sni";
+    handoff.tcp.actions.push_back(handoffAction);
+    profile->strategies.push_back(handoff);
+    profile->defaultTcp.push_back("list-handoff");
+
     const auto candidates = selector.candidates("blocked.example", false, "tcp-443");
     const std::vector<std::string> expected = {
         "direct", "adaptive-p1", "adaptive-p2", "adaptive-p3",
-        "adaptive-p4", "adaptive-p5", "adaptive-p6"
+        "adaptive-p4", "adaptive-p5", "adaptive-p6", "list-handoff",
+        "adaptive-http-b7"
     };
     if (!require(candidates.size() == expected.size(),
                  "All configured chain profiles must be candidates")) {
@@ -61,11 +81,17 @@ int main() {
                       << candidates[index].key() << '\n';
             return 1;
         }
-        if (index > 0 &&
+        if (index > 0 && index < expected.size() - 1 &&
+            expected[index].rfind("adaptive-p", 0) == 0 &&
             !require(candidates[index].strategy->adaptive,
                      "P1-P6 must be charged to the adaptive attempt budget")) {
             return 1;
         }
+    }
+    const auto outside = selector.candidates("outside.example", false, "tcp-443");
+    if (!require(outside.size() == 1 && outside.front().direct,
+                 "Hosts outside the base include list must stay direct")) {
+        return 1;
     }
     selector.markFailure("blocked.example", "adaptive-p1", "tcp-443");
     const auto afterFailure =

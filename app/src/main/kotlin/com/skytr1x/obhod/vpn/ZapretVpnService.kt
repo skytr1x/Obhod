@@ -6,6 +6,7 @@ import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.VpnService
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.system.OsConstants
@@ -129,19 +130,35 @@ class ZapretVpnService : VpnService(), NativeBridge.Protector, NativeBridge.List
     }
 
     private fun startVpn(profileId: String) {
-        AppLog.i(TAG, "Запуск: ${StrategyProfiles.label(profileId)}")
+        val baseProfileId =
+            if (profileId == StrategyProfiles.ADAPTIVE_ID) StrategyProfiles.DEFAULT_ID
+            else profileId
+        adaptiveChainActive = profileId == StrategyProfiles.ADAPTIVE_ID ||
+            getSharedPreferences("zapret", MODE_PRIVATE)
+                .getBoolean(StrategyProfiles.ADAPTIVE_PREF, false)
+        AppLog.i(
+            TAG,
+            "Запуск: ${StrategyProfiles.label(baseProfileId)}" +
+                if (adaptiveChainActive) " + Adaptive Desync Chain" else ""
+        )
         try {
             NativeBridge.load()
             val bundledProfileJson =
-                assets.open("strategies/$profileId.json").bufferedReader().use { it.readText() }
+                assets.open("strategies/$baseProfileId.json").bufferedReader().use { it.readText() }
             val baseProfileJson = try {
-                DomainListRepository.applyCachedList(this, profileId, bundledProfileJson)
+                DomainListRepository.applyCachedList(this, baseProfileId, bundledProfileJson)
             } catch (error: Exception) {
                 AppLog.w(TAG, "Кэш списка повреждён; используется список из APK", error)
                 bundledProfileJson
             }
-            adaptiveChainActive = profileId == StrategyProfiles.ADAPTIVE_ID
-            val profileJson = baseProfileJson
+            val profileJson = if (adaptiveChainActive) {
+                val adaptiveJson = assets.open(
+                    "strategies/${StrategyProfiles.ADAPTIVE_ID}.json"
+                ).bufferedReader().use { it.readText() }
+                StrategyProfiles.mergeAdaptiveProfile(baseProfileJson, adaptiveJson)
+            } else {
+                baseProfileJson
+            }
             val network = underlyingNetwork()
             val networkKey = currentNetworkKey(network)
             val calibration = NetworkCalibrator.resolve(this, networkKey, network)
@@ -157,7 +174,7 @@ class ZapretVpnService : VpnService(), NativeBridge.Protector, NativeBridge.List
             )
             AppLog.i(TAG, "DNS Discord/system-vs-DoH: ${calibration.dnsComparison.storageValue}")
             if (adaptiveChainActive) {
-                AppLog.i(TAG, "Adaptive Desync Chain: direct-first, profiles P1–P6, QUIC fallback enabled")
+                AppLog.i(TAG, "Adaptive Desync Chain: direct-first, P1–P6, then base-profile handoff")
             }
             logNetworkDetails(calibration.networkDetails)
             AppLog.i(
@@ -168,7 +185,7 @@ class ZapretVpnService : VpnService(), NativeBridge.Protector, NativeBridge.List
                     "Порядок TCP-стратегий для этой сети: $tcpOrder"
                 }
             )
-            val profileDir = File(filesDir, "strategy-profiles/$profileId").apply {
+            val profileDir = File(filesDir, "strategy-profiles/$baseProfileId").apply {
                 if (!exists() && !mkdirs()) error("Не удалось создать каталог профиля")
             }
             val profileFile = File(profileDir, "active-strategy.json").apply { writeText(profileJson) }
@@ -176,15 +193,21 @@ class ZapretVpnService : VpnService(), NativeBridge.Protector, NativeBridge.List
             val mtu = underlyingMtu(ipv6Available)
             configuredIpv6 = ipv6Available
             configuredMtu = mtu
+            val resolverAddresses = network
+                ?.let { connectivity.getLinkProperties(it)?.dnsServers }
+                .orEmpty()
+                .filter { ipv6Available || it !is Inet6Address }
+                .ifEmpty {
+                    listOf(InetAddress.getByName("1.1.1.1"), InetAddress.getByName("8.8.8.8"))
+                }
             val vpnBuilder = Builder()
-                .setSession("Obhod · ${StrategyProfiles.label(profileId)}")
+                .setSession("Obhod · ${StrategyProfiles.label(baseProfileId)}")
                 .setMtu(mtu)
                 .addAddress("198.18.0.1", 15)
                 .addRoute("0.0.0.0", 0)
-                .addDnsServer(InetAddress.getByName("1.1.1.1"))
-                .addDnsServer(InetAddress.getByName("8.8.8.8"))
                 .addDisallowedApplication(packageName)
                 .allowFamily(OsConstants.AF_INET6)
+            resolverAddresses.forEach { vpnBuilder.addDnsServer(it) }
             if (ipv6Available) {
                 vpnBuilder
                     .addAddress("fc00::1", 64)
@@ -236,9 +259,9 @@ misc:
             telegramProxyStarted = true
             AppLog.i(
                 TAG,
-                "TUN, SOCKS5 и MTProxy готовы: ${StrategyProfiles.label(profileId)}"
+                "TUN, SOCKS5 и MTProxy готовы: ${StrategyProfiles.label(baseProfileId)}"
             )
-            publishState(true, profileId)
+            publishState(true, baseProfileId)
             configuredNetworkFingerprint = currentUnderlyingNetworkFingerprint()
             registerNetworkCallback()
         } catch (error: Throwable) {
@@ -506,6 +529,12 @@ misc:
         append(network)
         append('|').append(link?.interfaceName ?: "")
         append('|').append(linkMtu(link))
+        runCatching {
+            @Suppress("DEPRECATION")
+            getSystemService(WifiManager::class.java)?.connectionInfo?.ssid
+        }.getOrNull()
+            ?.takeIf { it.isNotBlank() && it != "<unknown ssid>" }
+            ?.let { append('|').append(it) }
         link?.linkAddresses?.map { it.toString() }?.sorted()
             ?.forEach { append('|').append(it) }
         link?.dnsServers?.mapNotNull { it.hostAddress }?.sorted()
@@ -560,7 +589,7 @@ misc:
         }
         val profileJson = assets.open("strategies/$profileId.json").bufferedReader().use { it.readText() }
         val calibration = NetworkCalibrator.resolve(this, networkKey, network)
-        val tcpOrder = networkTcpOrder(profileJson, calibration.signal)
+        val tcpOrder = if (adaptiveChainActive) "" else networkTcpOrder(profileJson, calibration.signal)
         AppLog.i(
             TAG,
             "Смена сетевого профиля: ${calibration.signal.storageValue}" +

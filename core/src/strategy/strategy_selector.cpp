@@ -97,7 +97,25 @@ int StrategySelector::maxStrategyAttempts() const {
 
 bool StrategySelector::adaptiveChainEnabled() const {
     std::lock_guard<std::mutex> lock(m_mutex);
-    return m_profile && m_profile->adaptiveAttemptsPerMinute > 0;
+    return m_profile && m_profile->adaptiveChain;
+}
+
+bool StrategySelector::shouldDesyncHost(const std::string& rawHost) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_profile) return true;
+    const std::string host = normalizeHost(rawHost);
+    if (host.empty()) return true;
+    const std::string rule = m_profile->ruleStrategy(host);
+    if (!rule.empty()) return !isDirectId(rule) && !isTunnelId(rule);
+    if (m_profile->exclude.matches(host)) return false;
+    if (m_profile->directRu && isRussianDomain(host)) return false;
+    if (m_profile->include.empty()) return true;
+    return m_profile->include.matches(host);
+}
+
+bool StrategySelector::desyncsAllHosts() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return !m_profile || m_profile->include.empty();
 }
 
 bool StrategySelector::allowAdaptiveAttempt(const std::string& rawHost,
@@ -522,7 +540,7 @@ std::vector<StrategyChoice> StrategySelector::candidatesLocked(const std::string
                              const bool aTested = am && am->attempts > 0;
                              const bool bTested = bm && bm->attempts > 0;
                              if (aTested != bTested) {
-                                 return m_profile->adaptiveAttemptsPerMinute > 0
+                                 return m_profile->adaptiveChain
                                      ? !aTested
                                      : aTested;
                              }

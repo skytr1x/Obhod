@@ -69,6 +69,7 @@ struct Profile {
     int delayMs = 0;
     bool quicFallback = true;
     bool directFirst = false;
+    bool adaptiveChain = false;
     int adaptiveAttemptsPerMinute = 0;
     int maxStrategyAttempts = 10;
 

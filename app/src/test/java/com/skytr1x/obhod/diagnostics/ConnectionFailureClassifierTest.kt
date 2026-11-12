@@ -30,6 +30,26 @@ class ConnectionFailureClassifierTest {
     }
 
     @Test
+    fun tcpTimeoutNamesPossibleIpFilteringWithoutProof() {
+        val summary = ConnectionFailureClassifier.classify(
+            type = "tcp_connect_failed",
+            reason = "timeout"
+        )?.summary.orEmpty()
+
+        assertTrueContains(summary, "IP-фильтрация")
+        assertTrueContains(summary, "не доказано")
+    }
+
+    @Test
+    fun dnsFailureNamesPossibleSpoofingWithoutProof() {
+        val finding = ConnectionFailureClassifier.classify(type = "dns_resolution_failed")
+
+        assertEquals("dns_resolution_failed", finding?.code)
+        assertTrueContains(finding?.summary.orEmpty(), "DNS-подмена")
+        assertTrueContains(finding?.summary.orEmpty(), "не доказано")
+    }
+
+    @Test
     fun unknownEventsAreNotExportedAsClassifications() {
         assertNull(ConnectionFailureClassifier.classify("future_unknown_event"))
     }

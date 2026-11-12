@@ -1,14 +1,23 @@
 package com.skytr1x.obhod.notification
 
+import android.app.PendingIntent
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.net.VpnService
+import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
+import androidx.core.content.ContextCompat
 import com.skytr1x.obhod.ui.MainActivity
 import com.skytr1x.obhod.vpn.ZapretVpnService
 
 class ObhodTileService : TileService() {
+    override fun onTileAdded() {
+        super.onTileAdded()
+        updateTileState()
+    }
+
     override fun onStartListening() {
         super.onStartListening()
         updateTileState()
@@ -24,13 +33,38 @@ class ObhodTileService : TileService() {
                 Intent(this, ZapretVpnService::class.java)
                     .setAction(ZapretVpnService.ACTION_STOP)
             )
+            return
+        }
+        if (VpnService.prepare(this) == null) {
+            ObhodNotifications.markStarting(this)
+            val started = runCatching {
+                ContextCompat.startForegroundService(
+                    this,
+                    Intent(this, ZapretVpnService::class.java)
+                        .setAction(ZapretVpnService.ACTION_START)
+                )
+            }.isSuccess
+            if (started) {
+                updateTileState()
+                return
+            }
+            prefs.edit().putBoolean("starting", false).apply()
+        }
+        val activityIntent = Intent(this, MainActivity::class.java)
+            .setAction(MainActivity.ACTION_START_FROM_TILE)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startActivityAndCollapse(
+                PendingIntent.getActivity(
+                    this,
+                    0,
+                    activityIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+            )
         } else {
             @Suppress("DEPRECATION")
-            startActivityAndCollapse(
-                Intent(this, MainActivity::class.java)
-                    .setAction(MainActivity.ACTION_START_FROM_TILE)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-            )
+            startActivityAndCollapse(activityIntent)
         }
         updateTileState()
     }

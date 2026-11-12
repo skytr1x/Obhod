@@ -49,6 +49,7 @@ class MainActivity : AppCompatActivity() {
     private var starting by mutableStateOf(false)
     private var vpnRunning by mutableStateOf(false)
     private var selectedStrategyIndex by mutableIntStateOf(0)
+    private var adaptiveChainEnabled by mutableStateOf(false)
     private var updatingDomainList by mutableStateOf(false)
     private var domainListStatus by mutableStateOf("")
     private var batteryOptimizationIgnored by mutableStateOf(false)
@@ -127,7 +128,17 @@ class MainActivity : AppCompatActivity() {
                 .putString("selected_profile", StrategyProfiles.DEFAULT_ID)
                 .apply()
         }
-        val savedProfile = preferences.getString("selected_profile", StrategyProfiles.DEFAULT_ID)
+        var savedProfile = preferences.getString("selected_profile", StrategyProfiles.DEFAULT_ID)
+            ?: StrategyProfiles.DEFAULT_ID
+        if (savedProfile == StrategyProfiles.ADAPTIVE_ID) {
+            savedProfile = StrategyProfiles.DEFAULT_ID
+            preferences.edit()
+                .putString("selected_profile", savedProfile)
+                .putBoolean(StrategyProfiles.ADAPTIVE_PREF, true)
+                .apply()
+        }
+        adaptiveChainEnabled =
+            preferences.getBoolean(StrategyProfiles.ADAPTIVE_PREF, false)
         selectedStrategyIndex =
             StrategyProfiles.options.indexOfFirst { it.id == savedProfile }.coerceAtLeast(0)
 
@@ -138,6 +149,8 @@ class MainActivity : AppCompatActivity() {
                     starting = starting,
                     selectedStrategyIndex = selectedStrategyIndex,
                     onStrategySelected = ::selectStrategy,
+                    adaptiveChainEnabled = adaptiveChainEnabled,
+                    onAdaptiveChainChanged = ::setAdaptiveChain,
                     onToggle = {
                         if (isServiceActive() || starting) stopObhod() else requestVpnAndStart()
                     },
@@ -219,6 +232,13 @@ class MainActivity : AppCompatActivity() {
         getSharedPreferences("zapret", MODE_PRIVATE).edit()
             .putString("selected_profile", option.id).apply()
         AppLog.i("UI", "Выбрана стратегия: ${option.title}")
+    }
+
+    private fun setAdaptiveChain(enabled: Boolean) {
+        adaptiveChainEnabled = enabled
+        getSharedPreferences("zapret", MODE_PRIVATE).edit()
+            .putBoolean(StrategyProfiles.ADAPTIVE_PREF, enabled).apply()
+        AppLog.i("UI", "Adaptive Desync Chain: ${if (enabled) "включена" else "выключена"}")
     }
 
     private fun acceptTacticHelp() {
@@ -339,7 +359,8 @@ class MainActivity : AppCompatActivity() {
         val network = connectivity?.let(::underlyingNetworkForReport)
         val capabilities = network?.let(connectivity::getNetworkCapabilities)
         val details = network?.let { NetworkCalibrator.inspectNetwork(this, it) }
-        val messages = AppLog.entries.value.map { it.message }
+        val entries = AppLog.entries.value
+        val messages = entries.map { it.message }
         val networkStart = messages.indexOfLast { message ->
             message.startsWith("Калибровка сети: ") ||
                 message.startsWith("Смена сетевого профиля: ")
@@ -396,10 +417,10 @@ class MainActivity : AppCompatActivity() {
             selfTest = DiagnosticReport.latestSelfTest(currentNetworkMessages),
             latestFailure = DiagnosticReport.latestFailure(currentNetworkMessages),
             quicSuppressionCount = DiagnosticReport.quicSuppressionCount(currentNetworkMessages),
-            adaptiveProfileSelected = selectedProfile == StrategyProfiles.ADAPTIVE_ID,
+            adaptiveProfileSelected = adaptiveChainEnabled,
             adaptiveAttempts = currentNetworkMessages
-                .filter { it.startsWith("[ADAPTIVE]") }
-                .takeLast(20)
+                .filter { it.startsWith("[ADAPTIVE]") },
+            logs = entries.map { it.asLine() }
         )
         return DiagnosticReport.format(data)
     }

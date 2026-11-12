@@ -56,6 +56,8 @@ public:
     void setNetworkStrategyOrder(const std::string& tcpOrder);
     int maxStrategyAttempts() const;
     bool adaptiveChainEnabled() const;
+    bool shouldDesyncHost(const std::string& host) const;
+    bool desyncsAllHosts() const;
 
     std::string cachedStrategy(const std::string& host,
                                const std::string& scope = std::string()) const;

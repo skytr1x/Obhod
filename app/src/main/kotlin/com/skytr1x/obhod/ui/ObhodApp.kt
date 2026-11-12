@@ -4,9 +4,12 @@ package com.skytr1x.obhod.ui
 
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.app.StatusBarManager
 import android.net.Uri
+import android.os.Build
 import android.widget.Toast
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -32,6 +35,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -57,6 +61,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -77,6 +82,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
@@ -92,6 +98,7 @@ import androidx.compose.ui.unit.dp
 import com.skytr1x.obhod.logging.AppLog
 import com.skytr1x.obhod.diagnostics.TransferTestConfig
 import com.skytr1x.obhod.R
+import com.skytr1x.obhod.notification.ObhodTileService
 import com.skytr1x.obhod.proxy.TelegramProxyConfig
 import com.skytr1x.obhod.strategy.StrategyProfileOption
 import com.skytr1x.obhod.strategy.StrategyProfiles
@@ -110,6 +117,8 @@ internal fun ObhodApp(
     starting: Boolean,
     selectedStrategyIndex: Int,
     onStrategySelected: (Int) -> Unit,
+    adaptiveChainEnabled: Boolean,
+    onAdaptiveChainChanged: (Boolean) -> Unit,
     onToggle: () -> Unit,
     showTacticHelp: Boolean,
     onTacticHelpAccepted: () -> Unit,
@@ -167,6 +176,8 @@ internal fun ObhodApp(
                         starting = starting,
                         selectedStrategyIndex = selectedStrategyIndex,
                         onStrategySelected = onStrategySelected,
+                        adaptiveChainEnabled = adaptiveChainEnabled,
+                        onAdaptiveChainChanged = onAdaptiveChainChanged,
                         updatingDomainList = updatingDomainList,
                         domainListStatus = domainListStatus,
                         onUpdateDomainList = onUpdateDomainList,
@@ -350,6 +361,8 @@ private fun HomeScreen(
     starting: Boolean,
     selectedStrategyIndex: Int,
     onStrategySelected: (Int) -> Unit,
+    adaptiveChainEnabled: Boolean,
+    onAdaptiveChainChanged: (Boolean) -> Unit,
     updatingDomainList: Boolean,
     domainListStatus: String,
     onUpdateDomainList: () -> Unit,
@@ -401,6 +414,14 @@ private fun HomeScreen(
             domainListStatus = domainListStatus,
             onUpdateDomainList = onUpdateDomainList
         )
+        Spacer(Modifier.height(12.dp))
+        AdaptiveChainCard(
+            enabled = adaptiveChainEnabled,
+            switchEnabled = !running && !starting,
+            onEnabledChange = onAdaptiveChainChanged
+        )
+        Spacer(Modifier.height(16.dp))
+        QuickSettingsCard()
         Spacer(Modifier.height(16.dp))
         BatterySettingsCard(
             batteryOptimizationIgnored = batteryOptimizationIgnored,
@@ -416,6 +437,118 @@ private fun HomeScreen(
         )
     }
 
+}
+
+@Composable
+private fun AdaptiveChainCard(
+    enabled: Boolean,
+    switchEnabled: Boolean,
+    onEnabledChange: (Boolean) -> Unit
+) {
+    val titleColor = if (switchEnabled) {
+        MaterialTheme.colorScheme.onSurface
+    } else {
+        MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+    }
+    val supportingColor = if (switchEnabled) {
+        MaterialTheme.colorScheme.onSurfaceVariant
+    } else {
+        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f)
+    }
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.large,
+        color = MaterialTheme.colorScheme.surfaceContainerHigh
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .toggleable(
+                    value = enabled,
+                    enabled = switchEnabled,
+                    role = Role.Switch,
+                    onValueChange = onEnabledChange
+                )
+                .padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(
+                    text = "Adaptive Desync Chain",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = titleColor
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = "Экспериментально: полный перебор P1–P6, затем запасная тактика " +
+                        "выбранного профиля.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = supportingColor
+                )
+            }
+            Switch(
+                checked = enabled,
+                onCheckedChange = null,
+                enabled = switchEnabled
+            )
+        }
+    }
+}
+
+@Composable
+private fun QuickSettingsCard() {
+    val context = LocalContext.current
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.large,
+        color = MaterialTheme.colorScheme.surfaceContainerHigh
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Text(
+                text = "Быстрые настройки",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = "Плитка «Обход» в шторке включает и выключает обход одним касанием, " +
+                    "без открытия приложения.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                Spacer(Modifier.height(12.dp))
+                FilledTonalButton(
+                    onClick = {
+                        runCatching {
+                            context.getSystemService(StatusBarManager::class.java)
+                                ?.requestAddTileService(
+                                    ComponentName(context, ObhodTileService::class.java),
+                                    "Обход",
+                                    android.graphics.drawable.Icon.createWithResource(
+                                        context,
+                                        R.drawable.ic_shield
+                                    ),
+                                    context.mainExecutor
+                                ) { _ -> }
+                        }.onFailure {
+                            Toast.makeText(
+                                context,
+                                "Добавьте плитку \"Обход\" вручную в настройках шторки",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Добавить плитку")
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -619,20 +752,7 @@ private fun StrategySelector(
     onUpdateDomainList: () -> Unit
 ) {
     var expanded by remember { mutableStateOf(false) }
-    var showAdaptiveWarning by remember { mutableStateOf(false) }
-    var pendingProfileIndex by remember { mutableIntStateOf(-1) }
-    var acceptCountdown by remember { mutableIntStateOf(3) }
     val selected = options[selectedIndex]
-
-    LaunchedEffect(showAdaptiveWarning) {
-        if (showAdaptiveWarning) {
-            acceptCountdown = 3
-            repeat(3) {
-                delay(1_000)
-                acceptCountdown -= 1
-            }
-        }
-    }
 
     // dropdown menu
     ExposedDropdownMenuBox(
@@ -659,13 +779,7 @@ private fun StrategySelector(
                 DropdownMenuItem(
                     text = { Text(option.title, style = MaterialTheme.typography.titleSmall) },
                     onClick = {
-                        if (option.id == StrategyProfiles.ADAPTIVE_ID) {
-                            pendingProfileIndex = index
-                            acceptCountdown = 3
-                            showAdaptiveWarning = true
-                        } else {
-                            onSelected(index)
-                        }
+                        onSelected(index)
                         expanded = false
                     },
                     leadingIcon = {
@@ -719,47 +833,6 @@ private fun StrategySelector(
             text = "Стратегию можно сменить после выключения",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-    }
-    if (showAdaptiveWarning) {
-        AlertDialog(
-            onDismissRequest = {
-                showAdaptiveWarning = false
-                pendingProfileIndex = -1
-            },
-            title = { Text("Экспериментальная тактика") },
-            text = {
-                Text(
-                    "Данная тактика является эксперементальной и в какой-то мере запасным вариантом. " +
-                        "Используя эту тактику (на момент 1.5) стабильность быстрого и нормального " +
-                        "трафика далеко не гарантирована.",
-                    style = MaterialTheme.typography.bodyLarge
-                )
-            },
-            confirmButton = {
-                TextButton(
-                    enabled = acceptCountdown == 0,
-                    onClick = {
-                        if (pendingProfileIndex >= 0 && acceptCountdown == 0) {
-                            onSelected(pendingProfileIndex)
-                            showAdaptiveWarning = false
-                            pendingProfileIndex = -1
-                        }
-                    }
-                ) {
-                    Text(if (acceptCountdown == 0) "Принять" else "Принять ($acceptCountdown)")
-                }
-            },
-            dismissButton = {
-                TextButton(
-                    onClick = {
-                        showAdaptiveWarning = false
-                        pendingProfileIndex = -1
-                    }
-                ) {
-                    Text("Отмена")
-                }
-            }
         )
     }
 }
@@ -885,10 +958,38 @@ private fun LogsScreen(
                 text = {
                     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text(
-                            "В отчёт войдут версия приложения и устройства, тип сети, результаты " +
-                                "калибровки и последние метрики. Домены, IP-адреса, SSID и содержимое " +
-                                "трафика не включаются. Ничего не отправляется; выберите место, куда " +
-                                "сохранить файл. Оператора и регион можно указать вручную."
+                            text = buildAnnotatedString {
+                                append(
+                                    "В отчет войдут лишь версия приложения и устройства, тип сети, " +
+                                        "результаты калибровки и журнал приложения. Журнал может " +
+                                        "содержать домены, IP-адреса и параметры соединений.\n\n" +
+                                        "При указании оператора / региона, они также войдут в отчет. " +
+                                        "Важно понимать, что указывать такую информацию для других " +
+                                        "не рекомендуется, как и отправлять кому-то отчет вне нужды. " +
+                                        "Логи потребовать может "
+                                )
+                                pushStyle(SpanStyle(fontWeight = FontWeight.Bold))
+                                append("лишь разработчик ")
+                                withLink(
+                                    LinkAnnotation.Url(
+                                        url = "https://t.me/skytr1x",
+                                        styles = TextLinkStyles(
+                                            style = SpanStyle(
+                                                fontWeight = FontWeight.Bold,
+                                                textDecoration = TextDecoration.Underline
+                                            )
+                                        )
+                                    )
+                                ) {
+                                    append("skytr1x")
+                                }
+                                pop()
+                                append(" и лишь с ")
+                                pushStyle(SpanStyle(fontWeight = FontWeight.Bold))
+                                append("вашего согласия")
+                                pop()
+                                append(" для внесения правок.")
+                            }
                         )
                         OutlinedTextField(
                             value = operatorRegion,
