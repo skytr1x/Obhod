@@ -120,7 +120,9 @@ private:
                          std::size_t& tlsHeaderBytes, std::string& error,
                          bool expectHttp = false);
     void relay(int clientFd, int remoteFd, const std::string& host = {},
-               uint16_t port = 0, bool reportStream = false, int idleTimeoutMs = 0);
+               uint16_t port = 0, bool reportStream = false, int idleTimeoutMs = 0,
+               const std::string& strategyKey = {},
+               const std::string& strategyScope = {});
 
     bool createRemoteUdp(const std::string& host, uint16_t port, UdpPeer& peer,
                          std::string& error);

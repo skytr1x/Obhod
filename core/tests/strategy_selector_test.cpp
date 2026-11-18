@@ -19,7 +19,7 @@ bool require(bool condition, const char* message) {
     return false;
 }
 
-}  // namespace
+}
 
 int main() {
     std::ifstream profileFile(SKY_LIST_PROFILE_PATH);
@@ -93,6 +93,48 @@ int main() {
     selector.markSuccess("discord.com", "split-sni", 100, "tcp-443");
     if (!require(!selector.hostUnavailableCached("discord.com", "tcp-443"),
                  "A later successful strategy should clear the cooldown")) {
+        return 1;
+    }
+    selector.markSuccess("discord.com", "split-sni", 50, "tcp-443");
+    selector.markFailure("discord.com", "split-sni", "tcp-443", false, 4000);
+    if (!require(selector.cachedStrategy("discord.com", "tcp-443") == "split-sni",
+                 "A connect RTT spike must not drop the preferred strategy")) {
+        return 1;
+    }
+    selector.markFailure("discord.com", "split-sni", "tcp-443");
+    selector.markFailure("discord.com", "split-sni", "tcp-443");
+    if (!require(selector.cachedStrategy("discord.com", "tcp-443").empty(),
+                 "A burst of failures must clear the preferred strategy")) {
+        return 1;
+    }
+    selector.markSuccess("discord.com", "split-sni", 50, "tcp-443");
+    selector.markFailure("discord.com", "split-sni", "tcp-443", true);
+    selector.markSuccess("discord.com", "split-sni", 50, "tcp-443");
+    selector.markFailure("discord.com", "split-sni", "tcp-443", true);
+    if (!require(selector.cachedStrategy("discord.com", "tcp-443") == "split-sni",
+                 "Isolated stream stalls must not drop the preferred strategy")) {
+        return 1;
+    }
+    selector.markFailure("discord.com", "split-sni", "tcp-443", true);
+    if (!require(selector.cachedStrategy("discord.com", "tcp-443").empty(),
+                 "Repeated stream stalls must eventually clear the preferred strategy")) {
+        return 1;
+    }
+    selector.markSuccess("discord.com", "split-sni", 50, "tcp-443");
+    selector.markFailure("discord.com", "direct", "tcp-443");
+    for (int failure = 0; failure < 3; ++failure) {
+        selector.markFailure("discord.com", "split-sni", "tcp-443");
+    }
+    if (!require(selector.cachedStrategy("discord.com", "tcp-443") == "split-sni",
+                 "A failing direct path must not drop the preferred strategy")) {
+        return 1;
+    }
+    selector.markSuccess("discord.com", "direct", 50, "tcp-443");
+    for (int failure = 0; failure < 3; ++failure) {
+        selector.markFailure("discord.com", "direct", "tcp-443");
+    }
+    if (!require(selector.cachedStrategy("discord.com", "tcp-443").empty(),
+                 "A failing direct preference should still be dropped")) {
         return 1;
     }
     selector.markHostUnavailable("discord.com", "tcp-443");

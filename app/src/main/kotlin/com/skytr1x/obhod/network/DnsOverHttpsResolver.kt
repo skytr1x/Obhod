@@ -14,7 +14,11 @@ import java.net.SocketTimeoutException
 import java.nio.charset.StandardCharsets
 import java.security.SecureRandom
 import java.util.LinkedHashMap
+import java.util.concurrent.Callable
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorCompletionService
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocket
@@ -36,6 +40,11 @@ internal object DnsOverHttpsResolver {
         var lastUsedAtNanos: Long
     )
     private data class DohAnswer(val bytes: ByteArray, val sendSni: Boolean)
+    private data class DohResult(
+        val bytes: ByteArray,
+        val sendSni: Boolean,
+        val endpointKey: String
+    )
     private data class HttpDnsResponse(
         val body: ByteArray?,
         val reusable: Boolean,
@@ -61,12 +70,17 @@ internal object DnsOverHttpsResolver {
     private const val TOTAL_TIMEOUT_MS = 2500L
     private const val CONNECT_TIMEOUT_MS = 700
     private const val READ_TIMEOUT_MS = 1000
+    private const val HEDGE_DELAY_MS = 350L
+    private const val MAX_PARALLEL_QUERIES = 3
     private const val MAX_DNS_MESSAGE_SIZE = 65535
     private const val CIRCUIT_FAILURE_THRESHOLD = 3
     private const val CIRCUIT_OPEN_MS = 60_000L
     private const val CONNECTION_IDLE_TIMEOUT_MS = 30_000L
     private const val MAX_CONNECTIONS_PER_THREAD = 3
     private const val MAX_CACHE_ENTRIES = 512
+    private val hedgedExecutor = Executors.newCachedThreadPool { runnable ->
+        Thread(runnable, "doh-hedge").apply { isDaemon = true }
+    }
 
     fun resolve(
         query: ByteArray,
@@ -94,37 +108,114 @@ internal object DnsOverHttpsResolver {
                 all.sortedBy { if (it.key == preferredEndpoint) 0 else 1 }
         }
         val preferredSni = preferredSni(networkHandle)
-        for (endpoint in endpoints) {
-            val remainingMs = TimeUnit.NANOSECONDS.toMillis(
-                deadline - System.nanoTime()
-            ).toInt()
-            if (remainingMs <= 0) break
-            val answer = try {
-                queryProvider(
-                    endpoint.provider.host,
-                    endpoint.ip,
-                    query,
-                    network,
-                    protectSocket,
-                    remainingMs,
-                    preferredSni
+        val answer = queryHedged(
+            endpoints,
+            query,
+            network,
+            protectSocket,
+            preferredSni,
+            deadline
+        )
+        if (answer != null && isDnsResponse(answer.bytes, query)) {
+            cacheTtlMillis(answer.bytes)?.let { ttl ->
+                trimCache(System.nanoTime())
+                cache[key] = CachedAnswer(
+                    answer.bytes.copyOf(),
+                    System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(ttl)
                 )
-            } catch (_: IOException) {
-                null
             }
-            if (answer != null && isDnsResponse(answer.bytes, query)) {
-                cacheTtlMillis(answer.bytes)?.let { ttl ->
-                    trimCache(System.nanoTime())
-                    cache[key] = CachedAnswer(
-                        answer.bytes.copyOf(),
-                        System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(ttl)
-                    )
-                }
-                recordDohSuccess(networkHandle, endpoint.key, answer.sendSni)
-                return answer.bytes
-            }
+            recordDohSuccess(networkHandle, answer.endpointKey, answer.sendSni)
+            return answer.bytes
         }
         recordDohFailure(networkHandle)
+        return null
+    }
+
+    private fun queryHedged(
+        endpoints: List<Endpoint>,
+        query: ByteArray,
+        network: Network?,
+        protectSocket: (Socket) -> Boolean,
+        preferredSni: Boolean?,
+        deadlineNanos: Long
+    ): DohResult? {
+        if (endpoints.isEmpty()) return null
+        val completion = ExecutorCompletionService<DohResult?>(hedgedExecutor)
+        val futures = mutableListOf<Future<DohResult?>>()
+        var nextEndpoint = 0
+        var inFlight = 0
+
+        fun launchNext(): Boolean {
+            if (nextEndpoint >= endpoints.size || inFlight >= MAX_PARALLEL_QUERIES) {
+                return false
+            }
+            if (System.nanoTime() >= deadlineNanos) return false
+            val endpoint = endpoints[nextEndpoint++]
+            val task = Callable<DohResult?> {
+                val remainingMs = remainingTimeoutMs(deadlineNanos)
+                if (remainingMs <= 0) {
+                    null
+                } else {
+                    try {
+                        queryProvider(
+                            endpoint.provider.host,
+                            endpoint.ip,
+                            query,
+                            network,
+                            protectSocket,
+                            remainingMs,
+                            preferredSni
+                        )?.let { DohResult(it.bytes, it.sendSni, endpoint.key) }
+                    } catch (_: IOException) {
+                        null
+                    } catch (_: RuntimeException) {
+                        null
+                    }
+                }
+            }
+            futures += completion.submit(task)
+            inFlight += 1
+            return true
+        }
+
+        try {
+            launchNext()
+            var hedgeAt = System.nanoTime() +
+                TimeUnit.MILLISECONDS.toNanos(HEDGE_DELAY_MS)
+            while (inFlight > 0) {
+                val now = System.nanoTime()
+                if (now >= deadlineNanos) break
+                val waitNanos = minOf(hedgeAt - now, deadlineNanos - now)
+                val finished = if (waitNanos > 0) {
+                    completion.poll(waitNanos, TimeUnit.NANOSECONDS)
+                } else {
+                    completion.poll()
+                }
+                if (finished == null) {
+                    if (launchNext()) {
+                        hedgeAt = System.nanoTime() +
+                            TimeUnit.MILLISECONDS.toNanos(HEDGE_DELAY_MS)
+                    } else {
+                        hedgeAt = deadlineNanos
+                    }
+                    continue
+                }
+                inFlight -= 1
+                val result = try {
+                    finished.get()
+                } catch (_: Throwable) {
+                    null
+                }
+                if (result != null && isDnsResponse(result.bytes, query)) {
+                    return result
+                }
+                if (!launchNext()) {
+                    hedgeAt = deadlineNanos
+                }
+            }
+        } finally {
+            futures.forEach { it.cancel(true) }
+        }
         return null
     }
 

@@ -8,6 +8,8 @@ import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.system.OsConstants
 import android.telephony.TelephonyManager
@@ -38,6 +40,7 @@ class ZapretVpnService : VpnService(), NativeBridge.Protector, NativeBridge.List
         const val ACTION_STATE_CHANGED = "com.skytr1x.obhod.zapret.STATE_CHANGED"
         const val EXTRA_PROFILE = "profile"
         private const val TAG = "ZapretVpnService"
+        private const val NETWORK_REFRESH_DEBOUNCE_MS = 1500L
     }
 
     @Volatile private var nativeHandle = 0L
@@ -56,6 +59,8 @@ class ZapretVpnService : VpnService(), NativeBridge.Protector, NativeBridge.List
     private val lastProblemWarnings = ConcurrentHashMap<String, Long>()
     private val nativeLock = Any()
     private val connectivity by lazy { getSystemService(ConnectivityManager::class.java) }
+    private val networkRefreshHandler by lazy { Handler(Looper.getMainLooper()) }
+    private val networkRefreshRunnable = Runnable { processNetworkRefresh() }
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) = queueNetworkRefresh()
         override fun onLost(network: Network) = queueNetworkRefresh()
@@ -174,7 +179,7 @@ class ZapretVpnService : VpnService(), NativeBridge.Protector, NativeBridge.List
             )
             AppLog.i(TAG, "DNS Discord/system-vs-DoH: ${calibration.dnsComparison.storageValue}")
             if (adaptiveChainActive) {
-                AppLog.i(TAG, "Adaptive Desync Chain: direct-first, P1–P6, then base-profile handoff")
+                AppLog.i(TAG, "Adaptive Desync Chain: direct-first, P1–P9, then base-profile handoff")
             }
             logNetworkDetails(calibration.networkDetails)
             AppLog.i(
@@ -275,6 +280,8 @@ misc:
 
     private fun shutdown() {
         starting = false
+        networkRefreshHandler.removeCallbacks(networkRefreshRunnable)
+        networkRefreshQueued = false
         unregisterNetworkCallback()
         releaseNativeAndVpn()
         configuredNetworkFingerprint = ""
@@ -429,16 +436,71 @@ misc:
     private fun currentNetworkKey(network: Network? = underlyingNetwork()): String {
         network ?: return "default"
         val caps = connectivity.getNetworkCapabilities(network) ?: return "default"
-        val link = connectivity.getLinkProperties(network)
-        val material = networkMaterial(network, link)
         if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
             val telephony = getSystemService(TelephonyManager::class.java)
             val operator = runCatching { telephony.networkOperator }.getOrNull().orEmpty()
                 .ifBlank { runCatching { telephony.simOperator }.getOrNull().orEmpty() }
-            val mobile = if (operator.isBlank()) "mobile" else "mobile_$operator"
-            return "${mobile}_${sha1(material).take(12)}"
+            val radio = runCatching { radioGeneration(telephony) }.getOrDefault("")
+            return buildString {
+                append("mobile_")
+                append(operator.ifBlank { "unknown" })
+                if (radio.isNotBlank()) append('_').append(radio)
+            }
         }
-        return "wifi_" + sha1(material).take(12)
+        val wifiName = runCatching {
+            @Suppress("DEPRECATION")
+            getSystemService(WifiManager::class.java)?.connectionInfo?.let { info ->
+                info.ssid?.takeIf { it.isNotBlank() && it != "<unknown ssid>" }
+                    ?: info.bssid?.takeIf {
+                        it.isNotBlank() && it != "02:00:00:00:00:00"
+                    }
+            }
+        }.getOrNull()
+        if (!wifiName.isNullOrBlank()) {
+            return "wifi_" + sha1(wifiName).take(12)
+        }
+        val link = connectivity.getLinkProperties(network)
+        val gateway = link?.routes
+            ?.firstOrNull { it.destination.prefixLength == 0 && it.gateway != null }
+            ?.gateway?.hostAddress
+        if (!gateway.isNullOrBlank()) {
+            return "wifi_" + sha1("gw:$gateway").take(12)
+        }
+        val interfaceName = link?.interfaceName
+        if (!interfaceName.isNullOrBlank()) {
+            return "wifi_" + sha1(interfaceName).take(12)
+        }
+        return "wifi_unknown"
+    }
+
+    private fun radioGeneration(telephony: TelephonyManager): String {
+        val type = runCatching { telephony.dataNetworkType }.getOrNull() ?: return ""
+        return when {
+            type == TelephonyManager.NETWORK_TYPE_LTE -> "4g"
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+                type == TelephonyManager.NETWORK_TYPE_NR -> "5g"
+            type in setOf(
+                TelephonyManager.NETWORK_TYPE_UMTS,
+                TelephonyManager.NETWORK_TYPE_EVDO_0,
+                TelephonyManager.NETWORK_TYPE_EVDO_A,
+                TelephonyManager.NETWORK_TYPE_HSDPA,
+                TelephonyManager.NETWORK_TYPE_HSUPA,
+                TelephonyManager.NETWORK_TYPE_HSPA,
+                TelephonyManager.NETWORK_TYPE_EVDO_B,
+                TelephonyManager.NETWORK_TYPE_EHRPD,
+                TelephonyManager.NETWORK_TYPE_HSPAP,
+                TelephonyManager.NETWORK_TYPE_TD_SCDMA
+            ) -> "3g"
+            type in setOf(
+                TelephonyManager.NETWORK_TYPE_GPRS,
+                TelephonyManager.NETWORK_TYPE_EDGE,
+                TelephonyManager.NETWORK_TYPE_CDMA,
+                TelephonyManager.NETWORK_TYPE_1xRTT,
+                TelephonyManager.NETWORK_TYPE_IDEN,
+                TelephonyManager.NETWORK_TYPE_GSM
+            ) -> "2g"
+            else -> ""
+        }
     }
 
     private fun strategyNetworkKey(networkKey: String): String =
@@ -525,31 +587,21 @@ misc:
         }
     }
 
-    private fun networkMaterial(network: Network, link: LinkProperties?): String = buildString {
-        append(network)
-        append('|').append(link?.interfaceName ?: "")
-        append('|').append(linkMtu(link))
-        runCatching {
-            @Suppress("DEPRECATION")
-            getSystemService(WifiManager::class.java)?.connectionInfo?.ssid
-        }.getOrNull()
-            ?.takeIf { it.isNotBlank() && it != "<unknown ssid>" }
-            ?.let { append('|').append(it) }
-        link?.linkAddresses?.map { it.toString() }?.sorted()
-            ?.forEach { append('|').append(it) }
-        link?.dnsServers?.mapNotNull { it.hostAddress }?.sorted()
-            ?.forEach { append('|').append(it) }
-        link?.routes?.map { "${it.destination}/${it.gateway?.hostAddress}" }?.sorted()
-            ?.forEach { append('|').append(it) }
-    }
-
     @Synchronized
     private fun queueNetworkRefresh() {
         networkChangeGeneration++
-        if (networkRefreshQueued) return
-        networkRefreshQueued = true
+        networkRefreshHandler.removeCallbacks(networkRefreshRunnable)
+        networkRefreshHandler.postDelayed(
+            networkRefreshRunnable,
+            NETWORK_REFRESH_DEBOUNCE_MS
+        )
+    }
+
+    private fun processNetworkRefresh() {
         try {
             vpnExecutor.execute {
+                if (networkRefreshQueued) return@execute
+                networkRefreshQueued = true
                 try {
                     while (true) {
                         val generation = synchronized(this) { networkChangeGeneration }
@@ -644,8 +696,9 @@ misc:
     private fun currentUnderlyingNetworkFingerprint(): String {
         val network = underlyingNetwork() ?: return "none"
         val networkKey = currentNetworkKey(network)
-        val material = networkMaterial(network, connectivity.getLinkProperties(network))
-        return sha1("$networkKey|$material")
+        val mtu = linkMtu(connectivity.getLinkProperties(network))
+        val ipv6 = hasUnderlyingIpv6Route()
+        return sha1("$networkKey|$mtu|$ipv6")
     }
 
     private fun underlyingMtu(ipv6Enabled: Boolean): Int {

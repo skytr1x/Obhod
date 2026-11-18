@@ -482,7 +482,7 @@ private fun AdaptiveChainCard(
                 )
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    text = "Экспериментально: полный перебор P1–P6, затем запасная тактика " +
+                    text = "Экспериментально: полный перебор P1–P9, затем запасная тактика " +
                         "выбранного профиля.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = supportingColor

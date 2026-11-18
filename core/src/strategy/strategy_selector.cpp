@@ -20,6 +20,10 @@ namespace {
 constexpr auto kCacheTtl = std::chrono::hours(6);
 constexpr std::size_t kMaxCacheEntries = 4096;
 constexpr double kFailureHalfLifeHours = 2.0;
+constexpr int kPreferredFailureThreshold = 3;
+constexpr auto kPreferredFailureWindow = std::chrono::minutes(5);
+constexpr auto kDirectFailureWindow = std::chrono::seconds(120);
+constexpr auto kCacheFlushInterval = std::chrono::seconds(20);
 
 bool isDirectId(const std::string& id) {
     return id == "direct" || id == "bypass" || id == "none";
@@ -145,7 +149,14 @@ bool StrategySelector::allowAdaptiveAttempt(const std::string& rawHost,
 }
 
 StrategySelector::StrategySelector(std::shared_ptr<Profile> profile)
-    : m_profile(profile ? std::move(profile) : defaultProfile()) {}
+    : m_profile(profile ? std::move(profile) : defaultProfile()) {
+    m_lastCacheSave = std::chrono::steady_clock::now();
+}
+
+StrategySelector::~StrategySelector() {
+    flushCache();
+}
+
 
 StrategyChoice StrategySelector::findStrategy(const std::string& id) const {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -166,15 +177,18 @@ std::string StrategySelector::cacheFileLocked() const {
 }
 
 void StrategySelector::setCachePath(const std::string& basePath) {
+    flushCache();
     std::lock_guard<std::mutex> lock(m_mutex);
     m_cacheBasePath = basePath;
     m_cache.clear();
     m_networkPreferredTcp.clear();
     m_networkPreferredUdp.clear();
+    m_cacheDirty = false;
     loadCacheLocked();
 }
 
 std::size_t StrategySelector::setNetworkKey(const std::string& networkKey) {
+    flushCache();
     const std::string key = networkKey.empty() ? "default" : networkKey;
     std::lock_guard<std::mutex> lock(m_mutex);
     if (key != m_networkKey) {
@@ -184,6 +198,7 @@ std::size_t StrategySelector::setNetworkKey(const std::string& networkKey) {
         m_networkTcpOrder.clear();
         m_networkPreferredTcp.clear();
         m_networkPreferredUdp.clear();
+        m_cacheDirty = false;
     }
     loadCacheLocked();
     return m_cache.size();
@@ -263,35 +278,79 @@ void StrategySelector::loadCacheLocked() {
     }
 }
 
-void StrategySelector::saveCacheLocked() {
-    if (m_cacheBasePath.empty()) return;
-    const std::string path = cacheFileLocked();
-    if (path.empty()) return;
+std::string StrategySelector::serializeCacheLocked() const {
+    std::string out;
+    out.reserve(128 + m_cache.size() * 48);
+    out += "# skyunblock strategy cache v1\n";
+    out += "# network " + m_networkKey + "\n";
+    if (!m_networkPreferredTcp.empty()) {
+        out += "# network-tcp-preferred " + m_networkPreferredTcp + "\n";
+    }
+    if (!m_networkPreferredUdp.empty()) {
+        out += "# network-udp-preferred " + m_networkPreferredUdp + "\n";
+    }
+    std::size_t written = 0;
+    for (const auto& entry : m_cache) {
+        if (entry.second.preferred.empty()) continue;
+        if (written >= kMaxCacheEntries) break;
+        out += entry.second.preferred;
+        out += '\t';
+        out += entry.first;
+        out += '\n';
+        ++written;
+    }
+    return out;
+}
 
+void StrategySelector::writeCacheFile(const std::string& path,
+                                      const std::string& contents,
+                                      std::uint64_t generation) {
+    if (path.empty() || contents.empty()) return;
+    std::lock_guard<std::mutex> writeLock(m_cacheWriteMutex);
+    if (generation <= m_lastWrittenGeneration) return;
     const std::string temp = path + ".tmp";
     {
         std::ofstream output(temp, std::ios::trunc);
         if (!output) return;
-        output << "# skyunblock strategy cache v1\n";
-        output << "# network " << m_networkKey << "\n";
-        if (!m_networkPreferredTcp.empty()) {
-            output << "# network-tcp-preferred " << m_networkPreferredTcp << "\n";
+        output.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+        if (!output) {
+            output.close();
+            ::unlink(temp.c_str());
+            return;
         }
-        if (!m_networkPreferredUdp.empty()) {
-            output << "# network-udp-preferred " << m_networkPreferredUdp << "\n";
-        }
-        std::size_t written = 0;
-        for (const auto& entry : m_cache) {
-            if (entry.second.preferred.empty()) continue;
-            if (written >= kMaxCacheEntries) break;
-            output << entry.second.preferred << '\t' << entry.first << '\n';
-            ++written;
-        }
-        if (!output) return;
     }
     if (::rename(temp.c_str(), path.c_str()) != 0) {
         ::unlink(temp.c_str());
+        return;
     }
+    m_lastWrittenGeneration = generation;
+}
+
+bool StrategySelector::markCacheDirtyLocked(bool immediate) {
+    m_cacheDirty = true;
+    ++m_cacheGeneration;
+    if (immediate) return true;
+    return std::chrono::steady_clock::now() - m_lastCacheSave >=
+           kCacheFlushInterval;
+}
+
+void StrategySelector::flushCache() {
+    std::string path;
+    std::string contents;
+    std::uint64_t generation = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_cacheDirty) return;
+        m_cacheDirty = false;
+        path = cacheFileLocked();
+        if (!path.empty()) {
+            contents = serializeCacheLocked();
+            generation = m_cacheGeneration;
+            m_lastCacheSave = std::chrono::steady_clock::now();
+        }
+    }
+    if (path.empty() || contents.empty()) return;
+    writeCacheFile(path, contents, generation);
 }
 
 double StrategySelector::decayedFailures(const HostState::Metric& metric,
@@ -635,57 +694,138 @@ void StrategySelector::markSuccess(const std::string& rawHost, const std::string
     if (strategyId.empty()) return;
     const std::string host = normalizeHost(rawHost);
     const std::string stateKey = stateKeyFor(host, scope);
-    std::lock_guard<std::mutex> lock(m_mutex);
-    const auto now = std::chrono::steady_clock::now();
-    HostState& state = m_cache[stateKey];
-    state.preferred = strategyId;
-    state.unavailableUntil = {};
-    for (auto& entry : state.metrics) {
-        HostState::Metric& metric = entry.second;
-        metric.failures = decayedFailures(metric, now) * 0.5;
-        if (metric.failures < 0.01) metric.failures = 0.0;
-        metric.failedAt = now;
-    }
-    HostState::Metric& metric = state.metrics[strategyId];
-    ++metric.attempts;
-    ++metric.successes;
-    if (latencyMs > 0) {
-        metric.latencyMs = metric.latencyMs <= 0
-            ? latencyMs
-            : (metric.latencyMs * 3 + latencyMs) / 4;
-    }
-    state.updated = now;
-    if (!isDirectId(strategyId) && !isTunnelId(strategyId)) {
-        if (scope.rfind("udp-", 0) == 0) {
-            m_networkPreferredUdp = strategyId;
-        } else if (scope.rfind("tcp-", 0) == 0) {
-            m_networkPreferredTcp = strategyId;
+    bool flushNow = false;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const auto now = std::chrono::steady_clock::now();
+        HostState& state = m_cache[stateKey];
+        const bool preferredChanged = state.preferred != strategyId;
+        state.preferred = strategyId;
+        state.unavailableUntil = {};
+        for (auto& entry : state.metrics) {
+            HostState::Metric& metric = entry.second;
+            metric.failures = decayedFailures(metric, now) * 0.5;
+            if (metric.failures < 0.01) metric.failures = 0.0;
+            metric.failedAt = now;
         }
+        HostState::Metric& metric = state.metrics[strategyId];
+        ++metric.attempts;
+        ++metric.successes;
+        metric.consecutiveFailures = 0;
+        metric.consecutiveStart = {};
+        if (latencyMs > 0) {
+            metric.latencyMs = metric.latencyMs <= 0
+                ? latencyMs
+                : (metric.latencyMs * 3 + latencyMs) / 4;
+        }
+        state.updated = now;
+
+        bool networkPreferredChanged = false;
+        if (!isDirectId(strategyId) && !isTunnelId(strategyId)) {
+            if (scope.rfind("udp-", 0) == 0) {
+                if (m_networkPreferredUdp != strategyId) {
+                    m_networkPreferredUdp = strategyId;
+                    networkPreferredChanged = true;
+                }
+            } else if (scope.rfind("tcp-", 0) == 0) {
+                if (m_networkPreferredTcp != strategyId) {
+                    m_networkPreferredTcp = strategyId;
+                    networkPreferredChanged = true;
+                }
+            }
+        }
+        flushNow = markCacheDirtyLocked(preferredChanged || networkPreferredChanged);
     }
-    saveCacheLocked();
+    if (flushNow) flushCache();
     SKY_LOGI("StrategySelector: '%s' works for '%s'", strategyId.c_str(), host.c_str());
 }
 
 void StrategySelector::markFailure(const std::string& rawHost,
                                    const std::string& strategyId,
-                                   const std::string& scope) {
+                                   const std::string& scope, bool soft,
+                                   long connectRttMs) {
     if (strategyId.empty()) return;
     const std::string host = normalizeHost(rawHost);
     const std::string stateKey = stateKeyFor(host, scope);
-    std::lock_guard<std::mutex> lock(m_mutex);
-    const auto now = std::chrono::steady_clock::now();
-    HostState& state = m_cache[stateKey];
-    HostState::Metric& metric = state.metrics[strategyId];
-    metric.failures = decayedFailures(metric, now) + 1.0;
-    metric.failedAt = now;
-    ++metric.attempts;
-    if (state.preferred == strategyId) {
-        state.preferred.clear();
-        saveCacheLocked();
+    bool flushNow = false;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const auto now = std::chrono::steady_clock::now();
+        HostState& state = m_cache[stateKey];
+        HostState::Metric& metric = state.metrics[strategyId];
+        metric.failures = decayedFailures(metric, now) + (soft ? 0.5 : 1.0);
+        metric.failedAt = now;
+        metric.lastFailureAt = now;
+        ++metric.attempts;
+
+        if (soft) {
+            if (metric.streamStallStart.time_since_epoch().count() == 0 ||
+                now - metric.streamStallStart > kPreferredFailureWindow) {
+                metric.streamStallStart = now;
+                metric.streamStalls = 0;
+            }
+            ++metric.streamStalls;
+        } else {
+            if (metric.consecutiveStart.time_since_epoch().count() == 0 ||
+                now - metric.consecutiveStart > kPreferredFailureWindow) {
+                metric.consecutiveStart = now;
+                metric.consecutiveFailures = 0;
+            }
+            ++metric.consecutiveFailures;
+        }
+
+        if (state.preferred == strategyId) {
+            const auto direct = state.metrics.find("direct");
+            const bool directAlsoFailed =
+                !isDirectId(strategyId) && direct != state.metrics.end() &&
+                direct->second.lastFailureAt.time_since_epoch().count() != 0 &&
+                now - direct->second.lastFailureAt <= kDirectFailureWindow &&
+                decayedFailures(direct->second, now) > 0.01;
+            const bool connectRttSpike =
+                connectRttMs > 0 && metric.latencyMs > 0 &&
+                connectRttMs > metric.latencyMs * 3 + 100;
+            const bool burst =
+                metric.consecutiveFailures >= kPreferredFailureThreshold ||
+                metric.streamStalls >= kPreferredFailureThreshold;
+            if (burst && !directAlsoFailed && !connectRttSpike) {
+                state.preferred.clear();
+                metric.consecutiveFailures = 0;
+                metric.consecutiveStart = {};
+                metric.streamStalls = 0;
+                metric.streamStallStart = {};
+                flushNow = markCacheDirtyLocked(true);
+                SKY_LOGI("StrategySelector: dropping '%s' for '%s' after %d failures",
+                         strategyId.c_str(), host.c_str(),
+                         kPreferredFailureThreshold);
+            } else {
+                SKY_LOGD("StrategySelector: keeping '%s' for '%s' (failure %d/%d%s%s)",
+                         strategyId.c_str(), host.c_str(),
+                         soft ? metric.streamStalls : metric.consecutiveFailures,
+                         kPreferredFailureThreshold,
+                         directAlsoFailed ? ", direct also failing" : "",
+                         connectRttSpike ? ", connect RTT spike" : "");
+            }
+        }
+        state.updated = now;
+        if (!flushNow) flushNow = markCacheDirtyLocked(false);
     }
-    state.updated = now;
-    SKY_LOGD("StrategySelector: '%s' failed for '%s' (weight %.1f)",
-             strategyId.c_str(), host.c_str(), metric.failures);
+    if (flushNow) flushCache();
+    SKY_LOGD("StrategySelector: '%s' failed for '%s'%s",
+             strategyId.c_str(), host.c_str(), soft ? " (soft)" : "");
+}
+
+void StrategySelector::markStreamStable(const std::string& rawHost,
+                                        const std::string& strategyId,
+                                        const std::string& scope) {
+    if (strategyId.empty()) return;
+    const std::string host = normalizeHost(rawHost);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto it = m_cache.find(stateKeyFor(host, scope));
+    if (it == m_cache.end()) return;
+    auto metric = it->second.metrics.find(strategyId);
+    if (metric == it->second.metrics.end()) return;
+    metric->second.streamStalls = 0;
+    metric->second.streamStallStart = {};
 }
 
 void StrategySelector::markHostUnavailable(const std::string& rawHost,

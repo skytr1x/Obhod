@@ -52,8 +52,8 @@ constexpr int kDirectReplayTimeoutMs = 3000;
 
 constexpr int kResponseTimeoutMs = 1500;
 constexpr int kMaxStrategyAttempts = 10;
-constexpr int kAdaptiveChainProfiles = 6;
-constexpr int kStrategyBudgetMs = 15000;
+constexpr int kAdaptiveChainProfiles = 9;
+constexpr int kStrategyBudgetMs = 18000;
 constexpr int kMinAttemptBudgetMs = 1750;
 static_assert(kStrategyBudgetMs >= (kAdaptiveChainProfiles + 1) * kResponseTimeoutMs,
               "strategy budget must cover direct plus all adaptive profiles");
@@ -1435,6 +1435,7 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
     std::size_t lastTlsHeaderBytes = 0;
     std::size_t attemptsTried = 0;
     std::string lastFailure;
+    std::string verifiedStrategyKey;
     const char* lastFailureStage = "none";
 
     std::size_t firstSequentialCandidate = 0;
@@ -1482,9 +1483,6 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
                     std::min(2500, raceBudgetMs))) {
                 result.error = raceError;
                 result.failureStage = "reconnect";
-                if (m_selector && choice.strategy) {
-                    m_selector->markFailure(host, choice.key(), strategyScope);
-                }
             } else {
                 trackFd(fd);
                 result.fd = fd;
@@ -1548,20 +1546,25 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - attemptStart).count());
             if (!result.success && fd >= 0) {
+                const bool strategyExercised =
+                    std::strcmp(result.failureStage, "connect") != 0 &&
+                    std::strcmp(result.failureStage, "reconnect") != 0;
                 if (!result.responseVerified && !raceCancelled.load() &&
-                    std::strcmp(result.failureStage, "connect") != 0) {
+                    strategyExercised) {
                     emitEvent("[FAIL] %s:%u via %s remote_ip=%s: %s (%ld ms)",
                               host.c_str(), request.port, choice.key().c_str(),
                               sockaddrText(reinterpret_cast<const sockaddr*>(
                                   &result.address)).c_str(),
                               result.error.c_str(), result.elapsedMs);
                     if (m_selector) {
-                        m_selector->markFailure(host, choice.key(), strategyScope);
+                        m_selector->markFailure(host, choice.key(), strategyScope,
+                                                false, result.connectRttMs);
                     }
                 }
                 closeTrackedFd(fd);
             } else if (!raceCancelled.load() &&
-                       std::strcmp(result.failureStage, "connect") == 0) {
+                       (std::strcmp(result.failureStage, "connect") == 0 ||
+                        std::strcmp(result.failureStage, "reconnect") == 0)) {
                 emitEvent("[FAIL] %s:%u via %s: reconnect failed: %s",
                           host.c_str(), request.port, choice.key().c_str(),
                           result.error.c_str());
@@ -1610,6 +1613,7 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
             lastSendOk = true;
             verified = true;
             lastTlsHeaderBytes = winner.tlsHeaderBytes;
+            verifiedStrategyKey = choice.key();
             if (m_selector) {
                 m_selector->markSuccess(
                     host, choice.key(), winner.elapsedMs, strategyScope);
@@ -1713,9 +1717,7 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
                               host.c_str(), strategyId.c_str(),
                               eventErrorCategory(error));
                 }
-                if (m_selector && choice.strategy) {
-                    m_selector->markFailure(host, choice.key(), strategyScope);
-                }
+
                 lastFailure = error;
                 lastFailureStage = "reconnect";
                 lastSendOk = false;
@@ -1788,6 +1790,7 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
                                                candidateRemainingMs()),
                             readable, tlsHeaderBytes, responseError, httpRequest)) {
             verified = true;
+            verifiedStrategyKey = strategyId;
             const long ms = static_cast<long>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - attemptStart).count());
@@ -1847,7 +1850,8 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
         SKY_LOGW("SOCKS5: %s via '%s' failed: %s", target.c_str(),
                  strategyId.c_str(), responseError.c_str());
         if (m_selector && choice.strategy) {
-            m_selector->markFailure(host, choice.key(), strategyScope);
+            m_selector->markFailure(host, choice.key(), strategyScope, false,
+                                    connectRttMs);
         }
 
         if (i + 1 >= candidates.size()) {
@@ -1944,8 +1948,11 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
                   directReplayStatus);
     }
 
+    const std::string relayStrategy =
+        verified && completeClientHello ? verifiedStrategyKey : std::string();
     relay(clientFd, remoteFd, host, request.port, !completeClientHello,
-          completeClientHello ? kRelayTunnelIdleTimeoutMs : kRelayIdleTimeoutMs);
+          completeClientHello ? kRelayTunnelIdleTimeoutMs : kRelayIdleTimeoutMs,
+          relayStrategy, relayStrategy.empty() ? std::string() : strategyScope);
     closeTrackedFd(remoteFd);
 }
 
@@ -2534,7 +2541,9 @@ void Socks5Server::relayUdp(int clientFd, int relayFd) {
 }
 
 void Socks5Server::relay(int clientFd, int remoteFd, const std::string& host,
-                         uint16_t port, bool reportStream, int idleTimeoutMs) {
+                         uint16_t port, bool reportStream, int idleTimeoutMs,
+                         const std::string& strategyKey,
+                         const std::string& strategyScope) {
     bool clientOpen = true;
     bool remoteOpen = true;
     uint64_t clientToServer = 0;
@@ -2542,7 +2551,59 @@ void Socks5Server::relay(int clientFd, int remoteFd, const std::string& host,
     uint8_t buffer[16384];
     const int idleMs = idleTimeoutMs > 0 ? idleTimeoutMs : kRelayIdleTimeoutMs;
 
+    constexpr std::size_t kEarlyStreamBytes = 8192;
+    constexpr auto kEarlyStreamWindow = std::chrono::milliseconds(3000);
+    constexpr auto kEarlyStreamStall = std::chrono::milliseconds(1200);
+    const bool monitorEarlyStream = !strategyKey.empty() && !host.empty();
+    const auto relayStart = std::chrono::steady_clock::now();
+    const auto earlyDeadline = relayStart + kEarlyStreamWindow;
+    auto lastClientByteAt = relayStart;
+    auto lastServerByteAt = relayStart;
+    bool earlyActive = monitorEarlyStream;
+    bool earlyResolved = false;
+
+    const auto finishEarlyStream = [&](const char* reason) {
+        if (!earlyActive) return;
+        earlyActive = false;
+        if (earlyResolved) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (serverToClient >= kEarlyStreamBytes) {
+            earlyResolved = true;
+            if (m_selector) {
+                m_selector->markStreamStable(host, strategyKey, strategyScope);
+            }
+            return;
+        }
+
+        const bool closed = std::strcmp(reason, "closed") == 0;
+        const bool clientWaiting = clientOpen && clientToServer > 0 &&
+            (closed || lastClientByteAt > lastServerByteAt);
+        const bool stalled = now - lastServerByteAt >= kEarlyStreamStall;
+        if (clientWaiting && (closed || stalled)) {
+            earlyResolved = true;
+            if (m_selector) {
+                m_selector->markFailure(host, strategyKey, strategyScope,
+                                        /*soft=*/true);
+            }
+            emitEvent("[METRIC] kind=stream_stall strategy=%s bytes=%llu reason=%s",
+                      strategyKey.c_str(),
+                      static_cast<unsigned long long>(serverToClient), reason);
+        }
+    };
+
     while (m_running.load() && (clientOpen || remoteOpen)) {
+        int pollTimeoutMs = idleMs;
+        if (earlyActive) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                earlyDeadline - std::chrono::steady_clock::now()).count();
+            if (remaining <= 0) {
+                finishEarlyStream("window");
+            } else {
+                pollTimeoutMs = static_cast<int>(
+                    std::min<long long>(idleMs, remaining));
+            }
+        }
+
         struct pollfd fds[2] = {
             {clientOpen ? clientFd : -1, POLLIN, 0},
             {remoteOpen ? remoteFd : -1, POLLIN, 0}
@@ -2550,9 +2611,15 @@ void Socks5Server::relay(int clientFd, int remoteFd, const std::string& host,
 
         int rc;
         do {
-            rc = ::poll(fds, 2, idleMs);
+            rc = ::poll(fds, 2, pollTimeoutMs);
         } while (rc < 0 && errno == EINTR);
-        if (rc == 0) break;
+        if (rc == 0) {
+            if (earlyActive) {
+                finishEarlyStream("stall");
+                continue;
+            }
+            break;
+        }
         if (rc < 0) break;
         if (!m_running.load()) break;
 
@@ -2561,6 +2628,7 @@ void Socks5Server::relay(int clientFd, int remoteFd, const std::string& host,
             if (n > 0) {
                 if (!sendAll(remoteFd, buffer, static_cast<std::size_t>(n))) break;
                 clientToServer += static_cast<uint64_t>(n);
+                lastClientByteAt = std::chrono::steady_clock::now();
                 m_bytesIn.fetch_add(n);
                 m_bytesOut.fetch_add(n);
             } else {
@@ -2573,10 +2641,15 @@ void Socks5Server::relay(int clientFd, int remoteFd, const std::string& host,
             const ssize_t n = ::recv(remoteFd, buffer, sizeof(buffer), 0);
             if (n > 0) {
                 serverToClient += static_cast<uint64_t>(n);
+                lastServerByteAt = std::chrono::steady_clock::now();
                 m_bytesOut.fetch_add(n);
                 if (!sendAll(clientFd, buffer, static_cast<std::size_t>(n))) break;
                 m_bytesIn.fetch_add(n);
+                if (earlyActive && serverToClient >= kEarlyStreamBytes) {
+                    finishEarlyStream("enough");
+                }
             } else {
+                if (earlyActive) finishEarlyStream("closed");
                 remoteOpen = false;
                 ::shutdown(clientFd, SHUT_WR);
             }

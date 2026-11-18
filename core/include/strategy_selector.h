@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -33,6 +34,7 @@ struct StrategyChoice {
 class StrategySelector {
 public:
     explicit StrategySelector(std::shared_ptr<Profile> profile);
+    ~StrategySelector();
 
     StrategyChoice findStrategy(const std::string& id) const;
     bool quicFallbackEnabled() const;
@@ -44,7 +46,10 @@ public:
     void markSuccess(const std::string& host, const std::string& strategyId,
                      long latencyMs = -1, const std::string& scope = std::string());
     void markFailure(const std::string& host, const std::string& strategyId,
-                     const std::string& scope = std::string());
+                     const std::string& scope = std::string(), bool soft = false,
+                     long connectRttMs = -1);
+    void markStreamStable(const std::string& host, const std::string& strategyId,
+                          const std::string& scope = std::string());
     bool allowAdaptiveAttempt(const std::string& host,
                               const std::string& strategyId,
                               const std::string& scope);
@@ -61,6 +66,7 @@ public:
 
     std::string cachedStrategy(const std::string& host,
                                const std::string& scope = std::string()) const;
+    void flushCache();
 
 private:
     struct HostState {
@@ -70,6 +76,11 @@ private:
             int attempts = 0;
             int successes = 0;
             long latencyMs = -1;
+            int consecutiveFailures = 0;
+            std::chrono::steady_clock::time_point consecutiveStart{};
+            int streamStalls = 0;
+            std::chrono::steady_clock::time_point streamStallStart{};
+            std::chrono::steady_clock::time_point lastFailureAt{};
         };
 
         std::string preferred;
@@ -89,6 +100,11 @@ private:
     std::vector<std::string> m_networkTcpOrder;
     std::string m_networkPreferredTcp;
     std::string m_networkPreferredUdp;
+    mutable std::mutex m_cacheWriteMutex;
+    bool m_cacheDirty = false;
+    std::uint64_t m_cacheGeneration = 0;
+    std::uint64_t m_lastWrittenGeneration = 0;
+    std::chrono::steady_clock::time_point m_lastCacheSave{};
 
     StrategyChoice routeLocked(const std::string& host, bool udp,
                                const std::string& scope) const;
@@ -98,7 +114,10 @@ private:
 
     std::string cacheFileLocked() const;
     void loadCacheLocked();
-    void saveCacheLocked();
+    std::string serializeCacheLocked() const;
+    void writeCacheFile(const std::string& path, const std::string& contents,
+                        std::uint64_t generation);
+    bool markCacheDirtyLocked(bool immediate);
     static double decayedFailures(const HostState::Metric& metric,
                                   std::chrono::steady_clock::time_point now);
 };

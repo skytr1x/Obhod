@@ -67,8 +67,8 @@ int main() {
     const auto candidates = selector.candidates("blocked.example", false, "tcp-443");
     const std::vector<std::string> expected = {
         "direct", "adaptive-p1", "adaptive-p2", "adaptive-p3",
-        "adaptive-p4", "adaptive-p5", "adaptive-p6", "list-handoff",
-        "adaptive-http-b7"
+        "adaptive-p4", "adaptive-p5", "adaptive-p6", "adaptive-p7",
+        "adaptive-p8", "adaptive-p9", "list-handoff", "adaptive-http-b7"
     };
     if (!require(candidates.size() == expected.size(),
                  "All configured chain profiles must be candidates")) {
@@ -76,7 +76,7 @@ int main() {
     }
     for (std::size_t index = 0; index < expected.size(); ++index) {
         if (!require(candidates[index].key() == expected[index],
-                     "P0-P6 order must be preserved")) {
+                     "P0-P9 order must be preserved")) {
             std::cerr << "Unexpected candidate " << index << ": "
                       << candidates[index].key() << '\n';
             return 1;
@@ -84,7 +84,7 @@ int main() {
         if (index > 0 && index < expected.size() - 1 &&
             expected[index].rfind("adaptive-p", 0) == 0 &&
             !require(candidates[index].strategy->adaptive,
-                     "P1-P6 must be charged to the adaptive attempt budget")) {
+                     "P1-P9 must be charged to the adaptive attempt budget")) {
             return 1;
         }
     }
