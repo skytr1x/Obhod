@@ -3,7 +3,6 @@ import java.util.Properties
 
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
@@ -30,8 +29,8 @@ android {
 
     defaultConfig {
         applicationId = "com.skytr1x.obhod"
-        minSdk = 26
-        targetSdk = 34
+        minSdk = 30
+        targetSdk = 36
         ndkVersion = "27.2.12479018"
         versionCode = 1
         versionName = "1.4.1"
@@ -48,6 +47,12 @@ android {
             reset()
             include("arm64-v8a", "armeabi-v7a", "x86_64")
             isUniversalApk = true
+        }
+    }
+
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = true
         }
     }
 
@@ -94,14 +99,16 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
-
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+    }
+}
+
+androidComponents {
+    beforeVariants { variantBuilder ->
+        variantBuilder.javaClass.methods.find { it.name == "setUnitTestEnabled" }?.invoke(variantBuilder, true)
     }
 }
 
@@ -110,19 +117,20 @@ android {
 val rustCrateDir = rootProject.file("native/tgwsproxy")
 val rustTargetDir = layout.buildDirectory.dir("rust/target")
 val rustJniLibsDir = layout.buildDirectory.dir("generated/rust/jniLibs")
-val ndkBinDir = android.ndkDirectory.resolve("toolchains/llvm/prebuilt/${
-    when {
-        System.getProperty("os.name").lowercase().contains("win") -> "windows-x86_64"
-        System.getProperty("os.name").lowercase().contains("mac") -> "darwin-x86_64"
-        else -> "linux-x86_64"
-    }
-}/bin")
-val llvmAr = ndkBinDir.resolve(if (System.getProperty("os.name").lowercase().contains("win")) "llvm-ar.exe" else "llvm-ar")
 
-android.sourceSets.getByName("main").jniLibs.srcDir(rustJniLibsDir)
+android.sourceSets.getByName("main").jniLibs.srcDir(rustJniLibsDir.get().asFile)
 
 fun registerRustBuild(name: String, target: String, abi: String, clangName: String) =
     tasks.register<Exec>(name) {
+        val ndkDir = androidComponents.sdkComponents.ndkDirectory.get().asFile
+        val ndkBinDir = ndkDir.resolve("toolchains/llvm/prebuilt/${
+            when {
+                System.getProperty("os.name").lowercase().contains("win") -> "windows-x86_64"
+                System.getProperty("os.name").lowercase().contains("mac") -> "darwin-x86_64"
+                else -> "linux-x86_64"
+            }
+        }/bin")
+        val llvmAr = ndkBinDir.resolve(if (System.getProperty("os.name").lowercase().contains("win")) "llvm-ar.exe" else "llvm-ar")
         val clang = ndkBinDir.resolve(clangName + if (System.getProperty("os.name").lowercase().contains("win")) ".cmd" else "")
         val targetEnv = target.uppercase().replace('-', '_')
         val library = rustTargetDir.get().file("$target/release/libtgwsproxy.so").asFile
@@ -152,10 +160,10 @@ fun registerRustBuild(name: String, target: String, abi: String, clangName: Stri
     }
 
 val buildRustArm64 = registerRustBuild(
-    "buildTelegramRustArm64", "aarch64-linux-android", "arm64-v8a", "aarch64-linux-android26-clang"
+    "buildTelegramRustArm64", "aarch64-linux-android", "arm64-v8a", "aarch64-linux-android30-clang"
 )
 val buildRustArm32 = registerRustBuild(
-    "buildTelegramRustArm32", "armv7-linux-androideabi", "armeabi-v7a", "armv7a-linux-androideabi26-clang"
+    "buildTelegramRustArm32", "armv7-linux-androideabi", "armeabi-v7a", "armv7-linux-androideabi30-clang"
 )
 val buildTelegramRust = tasks.register("buildTelegramRust") {
     dependsOn(buildRustArm64, buildRustArm32)
@@ -165,13 +173,14 @@ tasks.named("preBuild").configure {
 }
 
 dependencies {
-    implementation("androidx.core:core-ktx:1.13.1")
+    implementation(platform("androidx.compose:compose-bom:2026.09.00"))
+    implementation("androidx.core:core-ktx:1.19.1")
     implementation("androidx.appcompat:appcompat:1.7.0")
-    implementation("androidx.activity:activity-compose:1.9.3")
-    implementation("androidx.compose.ui:ui:1.10.4")
-    implementation("androidx.compose.foundation:foundation:1.10.4")
-    implementation("androidx.compose.material3:material3:1.4.0")
-    implementation("net.java.dev.jna:jna:5.14.0@aar")
+    implementation("androidx.activity:activity-compose:1.13.0")
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.foundation:foundation")
+    implementation("androidx.compose.material3:material3")
+    implementation("net.java.dev.jna:jna:5.16.0@aar")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
 }
