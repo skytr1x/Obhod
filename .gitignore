@@ -1,6 +1,8 @@
 .gradle/
 build/
 
+.vscode/
+.git/
 .idea/
 *.iml
 local.properties
