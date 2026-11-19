@@ -919,6 +919,8 @@ bool Socks5Server::connectRemote(const std::string& host, uint16_t port, int& ou
     std::vector<socklen_t> lengths;
     if (!resolve(host, port, SOCK_STREAM, addresses, lengths, error)) {
         if (m_running.load()) {
+            emitEvent("[TCP-DNS-FAIL] host=%s port=%u reason=%s",
+                      host.c_str(), port, error.c_str());
             emitEvent("[CONNECT-FAIL] %s:%u: %s", host.c_str(), port,
                       error.c_str());
         }
@@ -929,6 +931,8 @@ bool Socks5Server::connectRemote(const std::string& host, uint16_t port, int& ou
         return false;
     }
 
+    emitEvent("[TCP-DNS] host=%s port=%u resolved_addresses=%zu",
+              host.c_str(), port, addresses.size());
     const std::size_t start = addressOffset % addresses.size();
     const auto connectDeadline = std::chrono::steady_clock::now() +
                                  std::chrono::milliseconds(std::max(timeoutMs, 1));
@@ -945,21 +949,30 @@ bool Socks5Server::connectRemote(const std::string& host, uint16_t port, int& ou
                                 SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
         if (fd < 0) {
             error = std::string("socket: ") + std::strerror(errno);
+            emitEvent("[TCP-IP-FAIL] %s:%u remote_ip=%s stage=socket reason=%s",
+                      host.c_str(), port,
+                      sockaddrText(reinterpret_cast<const sockaddr*>(&addresses[i])).c_str(),
+                      error.c_str());
             continue;
         }
         if (m_protector && !m_protector(fd)) {
             SKY_LOGW("SOCKS5: protect(fd=%d) failed", fd);
+            emitEvent("[TCP-IP-FAIL] %s:%u stage=vpn_protect reason=VpnService.protect_failed",
+                      host.c_str(), port);
             ::close(fd);
             error = "VpnService.protect failed";
             continue;
         }
 
         const auto connectStart = std::chrono::steady_clock::now();
+        const std::string remoteIp = sockaddrText(
+            reinterpret_cast<const sockaddr*>(&addresses[i]));
         if (!connectWithTimeout(fd,
                                 reinterpret_cast<const sockaddr*>(&addresses[i]),
                                 lengths[i], perAddressTimeout, error, &m_running)) {
-            SKY_LOGD("SOCKS5: connect %s:%u failed: %s", sockaddrText(
-                         reinterpret_cast<const sockaddr*>(&addresses[i])).c_str(),
+            emitEvent("[TCP-IP-FAIL] %s:%u remote_ip=%s reason=%s",
+                      host.c_str(), port, remoteIp.c_str(), error.c_str());
+            SKY_LOGD("SOCKS5: connect %s:%u failed: %s", remoteIp.c_str(),
                      port, error.c_str());
             ::close(fd);
             continue;
@@ -974,6 +987,9 @@ bool Socks5Server::connectRemote(const std::string& host, uint16_t port, int& ou
         ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
         setIoTimeout(fd, kFirstPayloadTimeoutMs / 1000);
 
+        emitEvent("[TCP-IP-OK] %s:%u remote_ip=%s rtt_ms=%d",
+                  host.c_str(), port, remoteIp.c_str(),
+                  connectRttMs ? *connectRttMs : 0);
         outFd = fd;
         if (outAddr) std::memcpy(outAddr, &addresses[i], sizeof(sockaddr_storage));
         if (outAddrLen) *outAddrLen = lengths[i];
@@ -1183,6 +1199,8 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
     [[maybe_unused]] TcpRequestLogScope requestLogScope(requestId);
     const std::string target = request.host + ':' + std::to_string(request.port);
     SKY_LOGI("SOCKS5: CONNECT %s", target.c_str());
+    emitEvent("[CONNECTION-START] host=%s port=%u",
+              request.host.c_str(), request.port);
 
     const auto planStart = std::chrono::steady_clock::now();
     const auto elapsed = [&planStart]() {
@@ -1225,14 +1243,22 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
             : sockaddrText(reinterpret_cast<const sockaddr*>(&remoteAddress));
     };
 
+    emitEvent("[CONNECTION-STAGE] stage=proxy_connected remote_ip=%s connect_rtt_ms=%d",
+              connectedIp().c_str(), connectRttMs);
     if (!sendReply(clientFd, SOCKS5_REP_SUCCESS)) {
+        emitEvent("[CONNECTION-END] result=client_reply_failed stage=socks_reply elapsed_ms=%ld",
+                  elapsed());
         closeTrackedFd(remoteFd);
         return;
     }
 
     const int firstSide = waitForInitialData(clientFd, remoteFd, 5000);
     if (firstSide != 1) {
-        relay(clientFd, remoteFd);
+        emitEvent("[CONNECTION-STAGE] stage=initial_payload_wait result=%s",
+                  firstSide == 2 ? "remote_closed_or_errored" : "timeout_or_poll_error");
+        relay(clientFd, remoteFd, request.host, request.port, true);
+        emitEvent("[CONNECTION-END] result=ended_before_payload stage=initial_payload_wait elapsed_ms=%ld",
+                  elapsed());
         closeTrackedFd(remoteFd);
         return;
     }
@@ -1242,6 +1268,8 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
     if (!readInitialPayload(clientFd, payload, payloadHost,
                             isMtprotoPort(request.port) &&
                                 isTelegramDcAddress(request.host))) {
+        emitEvent("[CONNECTION-END] result=client_payload_read_failed stage=initial_payload elapsed_ms=%ld",
+                  elapsed());
         closeTrackedFd(remoteFd);
         return;
     }
@@ -1257,6 +1285,13 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
     const bool completeClientHello =
         tlsClientHello && info.recordEnd > 0 && payload.size() >= info.recordEnd;
     const bool verifiablePayload = completeClientHello || httpRequest;
+    const char* payloadKind = completeClientHello ? "tls_client_hello"
+        : tlsClientHello ? "partial_tls_client_hello"
+        : httpRequest ? "http_request"
+        : mtprotoObfuscated ? "mtproto_obfuscated"
+        : "other";
+    emitEvent("[CONNECTION-STAGE] stage=payload_received kind=%s bytes=%zu verifiable=%s",
+              payloadKind, payload.size(), verifiablePayload ? "yes" : "no");
 
     std::string cached;
     if (m_selector) cached = m_selector->cachedStrategy(host, strategyScope);
@@ -1472,6 +1507,7 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
         const auto raceDeadline = raceStart + std::chrono::milliseconds(raceBudgetMs);
         attemptsTried += 2;
         const auto candidateRace = [&](std::size_t index) {
+            [[maybe_unused]] TcpRequestLogScope raceLogScope(requestId);
             RaceAttempt& result = raceAttempts[index];
             const StrategyChoice& choice = candidates[index];
             const auto attemptStart = std::chrono::steady_clock::now();
@@ -1950,9 +1986,17 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
 
     const std::string relayStrategy =
         verified && completeClientHello ? verifiedStrategyKey : std::string();
-    relay(clientFd, remoteFd, host, request.port, !completeClientHello,
+    relay(clientFd, remoteFd, host, request.port, true,
           completeClientHello ? kRelayTunnelIdleTimeoutMs : kRelayIdleTimeoutMs,
           relayStrategy, relayStrategy.empty() ? std::string() : strategyScope);
+    const char* connectionResult = verified ? "tls_response_observed"
+        : lastSendOk ? "payload_sent_unverified"
+        : std::strcmp(directReplayStatus, "sent_unverified") == 0
+            ? "direct_replay_sent_unverified" : "failed";
+    emitEvent("[CONNECTION-END] result=%s stage=%s reason=%s attempts=%zu elapsed_ms=%ld",
+              connectionResult, lastFailureStage,
+              lastFailure.empty() ? "none" : eventErrorCategory(lastFailure),
+              attemptsTried, elapsed());
     closeTrackedFd(remoteFd);
 }
 

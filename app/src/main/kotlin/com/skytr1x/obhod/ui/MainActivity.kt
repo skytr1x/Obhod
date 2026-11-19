@@ -420,7 +420,10 @@ class MainActivity : AppCompatActivity() {
             adaptiveProfileSelected = adaptiveChainEnabled,
             adaptiveAttempts = currentNetworkMessages
                 .filter { it.startsWith("[ADAPTIVE]") },
-            logs = entries.map { it.asLine() }
+            logs = entries.map { it.asLine() },
+            connectionEntries = entries,
+            vpnRunning = vpnRunning,
+            vpnStarting = starting
         )
         return DiagnosticReport.format(data)
     }

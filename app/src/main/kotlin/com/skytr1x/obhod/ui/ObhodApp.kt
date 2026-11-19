@@ -11,11 +11,12 @@ import android.app.StatusBarManager
 import android.net.Uri
 import android.os.Build
 import android.widget.Toast
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -41,12 +42,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.Icon
@@ -55,6 +56,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationBarItemDefaults
+import androidx.compose.material3.NavigationRail
+import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -138,6 +141,7 @@ internal fun ObhodApp(
     val pageStateHolder = rememberSaveableStateHolder()
     var tabIndex by rememberSaveable { mutableIntStateOf(0) }
     var showHelp by rememberSaveable(showTacticHelp) { mutableStateOf(showTacticHelp) }
+    var showProxyDialog by rememberSaveable { mutableStateOf(false) }
     val selectedTab = ObhodTab.entries[tabIndex]
 
     val copyText: (String) -> Unit = remember(context, snackbarHostState, scope) {
@@ -151,60 +155,97 @@ internal fun ObhodApp(
         }
     }
 
-    Scaffold(
-        containerColor = MaterialTheme.colorScheme.background,
-        contentWindowInsets = WindowInsets.safeDrawing.only(
-            WindowInsetsSides.Top + WindowInsetsSides.Horizontal
-        ),
-        snackbarHost = { SnackbarHost(snackbarHostState) },
-        bottomBar = {
-            ObhodNavigationBar(
-                selected = tabIndex,
-                onSelect = { tabIndex = it }
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val useNavigationRail = maxWidth >= 600.dp
+        val contentInsets = if (useNavigationRail) {
+            WindowInsets.safeDrawing.only(
+                WindowInsetsSides.Top + WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom
+            )
+        } else {
+            WindowInsets.safeDrawing.only(
+                WindowInsetsSides.Top + WindowInsetsSides.Horizontal
             )
         }
-    ) { innerPadding ->
-        Box(
-            Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-        ) {
-            pageStateHolder.SaveableStateProvider(selectedTab.name) {
-                when (selectedTab) {
-                    ObhodTab.Home -> HomeScreen(
+
+        Scaffold(
+            containerColor = MaterialTheme.colorScheme.background,
+            contentWindowInsets = contentInsets,
+            snackbarHost = { SnackbarHost(snackbarHostState) },
+            bottomBar = {
+                Column {
+                    ObhodActionDock(
                         vpnRunning = vpnRunning,
                         starting = starting,
-                        selectedStrategyIndex = selectedStrategyIndex,
-                        onStrategySelected = onStrategySelected,
-                        adaptiveChainEnabled = adaptiveChainEnabled,
-                        onAdaptiveChainChanged = onAdaptiveChainChanged,
-                        updatingDomainList = updatingDomainList,
-                        domainListStatus = domainListStatus,
-                        onUpdateDomainList = onUpdateDomainList,
-                        batteryOptimizationIgnored = batteryOptimizationIgnored,
-                        onRequestBatteryOptimization = onRequestBatteryOptimization,
                         onToggle = onToggle,
-                        onCopyText = copyText
+                        onOpenProxy = { showProxyDialog = true }
                     )
-
-                    ObhodTab.Logs -> LogsScreen(
-                        onCopyText = copyText,
-                        onExportDiagnosticReport = onExportDiagnosticReport,
-                        vpnRunning = vpnRunning,
-                        transferTestRunning = transferTestRunning,
-                        transferTestStatus = transferTestStatus,
-                        onRunTransferTest = onRunTransferTest
-                    )
-                    ObhodTab.Source -> SourceScreen()
+                    if (!useNavigationRail) {
+                        ObhodNavigationBar(
+                            selected = tabIndex,
+                            onSelect = { tabIndex = it }
+                        )
+                    }
                 }
             }
-            if (showHelp) {
-                TacticHelpDialog(
-                    onAccepted = {
-                        onTacticHelpAccepted()
-                        showHelp = false
+        ) { innerPadding ->
+            Row(
+                Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding)
+            ) {
+                if (useNavigationRail) {
+                    ObhodNavigationRail(
+                        selected = tabIndex,
+                        onSelect = { tabIndex = it }
+                    )
+                }
+                Box(
+                    Modifier
+                        .weight(1f)
+                        .fillMaxSize()
+                ) {
+                    pageStateHolder.SaveableStateProvider(selectedTab.name) {
+                        when (selectedTab) {
+                            ObhodTab.Home -> HomeScreen(
+                                vpnRunning = vpnRunning,
+                                starting = starting,
+                                selectedStrategyIndex = selectedStrategyIndex,
+                                onStrategySelected = onStrategySelected,
+                                adaptiveChainEnabled = adaptiveChainEnabled,
+                                onAdaptiveChainChanged = onAdaptiveChainChanged,
+                                updatingDomainList = updatingDomainList,
+                                domainListStatus = domainListStatus,
+                                onUpdateDomainList = onUpdateDomainList,
+                                batteryOptimizationIgnored = batteryOptimizationIgnored,
+                                onRequestBatteryOptimization = onRequestBatteryOptimization
+                            )
+
+                            ObhodTab.Logs -> LogsScreen(
+                                onCopyText = copyText,
+                                onExportDiagnosticReport = onExportDiagnosticReport,
+                                vpnRunning = vpnRunning,
+                                transferTestRunning = transferTestRunning,
+                                transferTestStatus = transferTestStatus,
+                                onRunTransferTest = onRunTransferTest
+                            )
+                            ObhodTab.Source -> SourceScreen()
+                        }
                     }
-                )
+                    if (showHelp) {
+                        TacticHelpDialog(
+                            onAccepted = {
+                                onTacticHelpAccepted()
+                                showHelp = false
+                            }
+                        )
+                    }
+                    if (showProxyDialog) {
+                        ProxyDialog(
+                            onDismiss = { showProxyDialog = false },
+                            onCopyText = copyText
+                        )
+                    }
+                }
             }
         }
     }
@@ -356,6 +397,29 @@ private fun ObhodNavigationBar(selected: Int, onSelect: (Int) -> Unit) {
 }
 
 @Composable
+private fun ObhodNavigationRail(selected: Int, onSelect: (Int) -> Unit) {
+    NavigationRail(
+        containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
+        windowInsets = WindowInsets(0, 0, 0, 0)
+    ) {
+        ObhodTab.entries.forEachIndexed { index, tab ->
+            NavigationRailItem(
+                selected = index == selected,
+                onClick = { onSelect(index) },
+                icon = {
+                    Icon(
+                        painter = painterResource(tab.icon),
+                        contentDescription = tab.label
+                    )
+                },
+                label = { Text(tab.label) },
+                alwaysShowLabel = true
+            )
+        }
+    }
+}
+
+@Composable
 private fun HomeScreen(
     vpnRunning: Boolean,
     starting: Boolean,
@@ -367,76 +431,136 @@ private fun HomeScreen(
     domainListStatus: String,
     onUpdateDomainList: () -> Unit,
     batteryOptimizationIgnored: Boolean,
-    onRequestBatteryOptimization: () -> Unit,
-    onToggle: () -> Unit,
-    onCopyText: (String) -> Unit,
+    onRequestBatteryOptimization: () -> Unit
 ) {
-    var showProxyDialog by rememberSaveable { mutableStateOf(false) }
-    val running = vpnRunning
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        val useTwoPaneLayout = maxWidth >= 840.dp
 
-    Column(
-        Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 24.dp)
-    ) {
-        Spacer(Modifier.height(24.dp))
-        Text(
-            text = "Обход",
-            style = MaterialTheme.typography.displaySmall,
-            fontWeight = FontWeight.SemiBold
-        )
-        Text(
-            text = "VPN дорогой нынче...",
-            style = MaterialTheme.typography.bodyLarge,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        Spacer(Modifier.height(24.dp))
-        StatusCard(
-            vpnRunning = vpnRunning,
-            starting = starting,
-            onToggle = onToggle,
-            onOpenProxy = { showProxyDialog = true }
-        )
-        Spacer(Modifier.height(32.dp))
-        Text(
-            text = "Стратегии",
-            style = MaterialTheme.typography.titleLarge
-        )
-        Spacer(Modifier.height(12.dp))
-        StrategySelector(
-            options = StrategyProfiles.options,
-            selectedIndex = selectedStrategyIndex,
-            enabled = !running && !starting,
-            onSelected = onStrategySelected,
-            isStarting = starting,
-            updatingDomainList = updatingDomainList,
-            domainListStatus = domainListStatus,
-            onUpdateDomainList = onUpdateDomainList
-        )
-        Spacer(Modifier.height(12.dp))
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState()),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .widthIn(max = 1280.dp)
+                    .padding(horizontal = 20.dp)
+            ) {
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    text = "Обход",
+                    style = MaterialTheme.typography.headlineMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = "VPN дорогой нынче...",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(12.dp))
+
+                if (useTwoPaneLayout) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+                        Column(Modifier.weight(1f)) {
+                            ConnectionSetup(
+                                vpnRunning = vpnRunning,
+                                starting = starting,
+                                selectedStrategyIndex = selectedStrategyIndex,
+                                strategyEnabled = !vpnRunning && !starting,
+                                onStrategySelected = onStrategySelected,
+                                updatingDomainList = updatingDomainList,
+                                domainListStatus = domainListStatus,
+                                onUpdateDomainList = onUpdateDomainList
+                            )
+                        }
+                        Column(Modifier.weight(1f)) {
+                            AdditionalSettings(
+                                adaptiveChainEnabled = adaptiveChainEnabled,
+                                switchEnabled = !vpnRunning && !starting,
+                                onAdaptiveChainChanged = onAdaptiveChainChanged,
+                                batteryOptimizationIgnored = batteryOptimizationIgnored,
+                                onRequestBatteryOptimization = onRequestBatteryOptimization
+                            )
+                        }
+                    }
+                } else {
+                    ConnectionSetup(
+                        vpnRunning = vpnRunning,
+                        starting = starting,
+                        selectedStrategyIndex = selectedStrategyIndex,
+                        strategyEnabled = !vpnRunning && !starting,
+                        onStrategySelected = onStrategySelected,
+                        updatingDomainList = updatingDomainList,
+                        domainListStatus = domainListStatus,
+                        onUpdateDomainList = onUpdateDomainList
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    AdditionalSettings(
+                        adaptiveChainEnabled = adaptiveChainEnabled,
+                        switchEnabled = !vpnRunning && !starting,
+                        onAdaptiveChainChanged = onAdaptiveChainChanged,
+                        batteryOptimizationIgnored = batteryOptimizationIgnored,
+                        onRequestBatteryOptimization = onRequestBatteryOptimization
+                    )
+                }
+                Spacer(Modifier.height(20.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun ConnectionSetup(
+    vpnRunning: Boolean,
+    starting: Boolean,
+    selectedStrategyIndex: Int,
+    strategyEnabled: Boolean,
+    onStrategySelected: (Int) -> Unit,
+    updatingDomainList: Boolean,
+    domainListStatus: String,
+    onUpdateDomainList: () -> Unit
+) {
+    StatusSummary(vpnRunning = vpnRunning, starting = starting)
+    Spacer(Modifier.height(16.dp))
+    Text(
+        text = "Стратегии",
+        style = MaterialTheme.typography.titleLarge
+    )
+    Spacer(Modifier.height(8.dp))
+    StrategySelector(
+        options = StrategyProfiles.options,
+        selectedIndex = selectedStrategyIndex,
+        enabled = strategyEnabled,
+        onSelected = onStrategySelected,
+        isStarting = starting,
+        updatingDomainList = updatingDomainList,
+        domainListStatus = domainListStatus,
+        onUpdateDomainList = onUpdateDomainList
+    )
+}
+
+@Composable
+private fun AdditionalSettings(
+    adaptiveChainEnabled: Boolean,
+    switchEnabled: Boolean,
+    onAdaptiveChainChanged: (Boolean) -> Unit,
+    batteryOptimizationIgnored: Boolean,
+    onRequestBatteryOptimization: () -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         AdaptiveChainCard(
             enabled = adaptiveChainEnabled,
-            switchEnabled = !running && !starting,
+            switchEnabled = switchEnabled,
             onEnabledChange = onAdaptiveChainChanged
         )
-        Spacer(Modifier.height(16.dp))
         QuickSettingsCard()
-        Spacer(Modifier.height(16.dp))
         BatterySettingsCard(
             batteryOptimizationIgnored = batteryOptimizationIgnored,
             onRequestBatteryOptimization = onRequestBatteryOptimization
         )
-        Spacer(Modifier.height(32.dp))
     }
-
-    if (showProxyDialog) {
-        ProxyDialog(
-            onDismiss = { showProxyDialog = false },
-            onCopyText = onCopyText
-        )
-    }
-
 }
 
 @Composable
@@ -469,9 +593,9 @@ private fun AdaptiveChainCard(
                     role = Role.Switch,
                     onValueChange = onEnabledChange
                 )
-                .padding(16.dp),
+                .padding(14.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(16.dp)
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Column(Modifier.weight(1f)) {
                 Text(
@@ -506,7 +630,7 @@ private fun QuickSettingsCard() {
         shape = MaterialTheme.shapes.large,
         color = MaterialTheme.colorScheme.surfaceContainerHigh
     ) {
-        Column(Modifier.padding(16.dp)) {
+        Column(Modifier.padding(14.dp)) {
             Text(
                 text = "Быстрые настройки",
                 style = MaterialTheme.typography.titleMedium,
@@ -563,7 +687,7 @@ private fun BatterySettingsCard(
         shape = MaterialTheme.shapes.large,
         color = MaterialTheme.colorScheme.surfaceContainerHigh
     ) {
-        Column(Modifier.padding(16.dp)) {
+        Column(Modifier.padding(14.dp)) {
             Text(
                 text = "Работа в фоне",
                 style = MaterialTheme.typography.titleMedium,
@@ -620,122 +744,215 @@ private fun BatterySettingsCard(
 }
 
 @Composable
-private fun StatusCard(
+private fun StatusSummary(
     vpnRunning: Boolean,
-    starting: Boolean,
-    onToggle: () -> Unit,
-    onOpenProxy: () -> Unit
+    starting: Boolean
 ) {
-    val running = vpnRunning
-    val container = if (running) {
-        MaterialTheme.colorScheme.primary
-    } else {
-        MaterialTheme.colorScheme.surfaceContainerHigh
-    }
-    val content = if (running) {
-        MaterialTheme.colorScheme.onPrimary
-    } else {
-        MaterialTheme.colorScheme.onSurface
-    }
-    val buttonContainer = if (running) content else MaterialTheme.colorScheme.primary
-    val buttonContent = if (running) container else MaterialTheme.colorScheme.onPrimary
     val title = when {
         starting -> "Запуск обхода…"
-        running -> "Обход включен"
+        vpnRunning -> "Обход включен"
         else -> "Обход выключен"
     }
     val subtitle = when {
         starting -> "Старт системы..."
-        running -> "Системный обход и MTProxy работают"
+        vpnRunning -> "Системный обход и MTProxy работают"
         else -> "Выберите стратегию и включите обход"
     }
 
     Surface(
         modifier = Modifier.fillMaxWidth(),
-        shape = MaterialTheme.shapes.extraLarge,
-        color = container,
-        contentColor = content
+        shape = MaterialTheme.shapes.large,
+        color = MaterialTheme.colorScheme.surfaceContainerHigh
     ) {
-        Column(Modifier.padding(24.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(
-                    Modifier
-                        .size(12.dp)
-                        .background(content, CircleShape)
-                )
-                Spacer(Modifier.width(12.dp))
+        Row(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Box(
+                Modifier
+                    .size(12.dp)
+                    .background(
+                        if (vpnRunning) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                        CircleShape
+                    )
+            )
+            Column {
                 Text(
                     text = title,
-                    style = MaterialTheme.typography.headlineSmall,
-                    fontWeight = FontWeight.SemiBold
-                )
-            }
-            Spacer(Modifier.height(8.dp))
-            Text(
-                text = subtitle,
-                style = MaterialTheme.typography.bodyMedium,
-                color = content.copy(alpha = 0.72f)
-            )
-            Spacer(Modifier.height(20.dp))
-            Button(
-                onClick = onToggle,
-                enabled = !starting,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(64.dp),
-                shape = CircleShape,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = buttonContainer,
-                    contentColor = buttonContent,
-                    disabledContainerColor = buttonContainer.copy(alpha = 0.55f),
-                    disabledContentColor = buttonContent.copy(alpha = 0.8f)
-                )
-            ) {
-                if (starting) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(20.dp),
-                        strokeWidth = 2.dp,
-                        color = buttonContent
-                    )
-                    Spacer(Modifier.width(12.dp))
-                } else {
-                    Icon(
-                        painter = painterResource(
-                            if (running) R.drawable.ic_stop else R.drawable.ic_play
-                        ),
-                        contentDescription = null,
-                        modifier = Modifier.size(22.dp)
-                    )
-                    Spacer(Modifier.width(12.dp))
-                }
-                Text(
-                    text = when {
-                        starting -> "Запуск…"
-                        running -> "Выключить обходку"
-                        else -> "Включить обходку"
-                    },
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold
                 )
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
-            Spacer(Modifier.height(12.dp))
-            OutlinedButton(
-                onClick = onOpenProxy,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(56.dp),
-                shape = CircleShape,
-                border = BorderStroke(1.dp, content.copy(alpha = 0.25f)),
-                colors = ButtonDefaults.outlinedButtonColors(contentColor = content)
-            ) {
+        }
+    }
+}
+
+@Composable
+private fun ObhodActionDock(
+    vpnRunning: Boolean,
+    starting: Boolean,
+    onToggle: () -> Unit,
+    onOpenProxy: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 4.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Surface(
+            modifier = Modifier
+                .widthIn(max = 720.dp)
+                .fillMaxWidth(),
+            shape = RoundedCornerShape(28.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerHigh
+        ) {
+            BoxWithConstraints(Modifier.padding(8.dp)) {
+                if (maxWidth >= 440.dp) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        MainDockButton(
+                            vpnRunning = vpnRunning,
+                            starting = starting,
+                            onToggle = onToggle,
+                            compact = false,
+                            modifier = Modifier.weight(1f)
+                        )
+                        ProxyDockButton(
+                            compact = false,
+                            onClick = onOpenProxy
+                        )
+                    }
+                } else {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        MainDockButton(
+                            vpnRunning = vpnRunning,
+                            starting = starting,
+                            onToggle = onToggle,
+                            compact = true,
+                            modifier = Modifier.weight(1f)
+                        )
+                        ProxyDockButton(
+                            compact = true,
+                            onClick = onOpenProxy,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MainDockButton(
+    vpnRunning: Boolean,
+    starting: Boolean,
+    onToggle: () -> Unit,
+    compact: Boolean,
+    modifier: Modifier = Modifier
+) {
+    Button(
+        onClick = onToggle,
+        enabled = !starting,
+        modifier = modifier.height(if (compact) 64.dp else 52.dp),
+        shape = CircleShape
+    ) {
+        if (compact) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                if (starting) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        strokeWidth = 2.dp
+                    )
+                } else {
+                    Icon(
+                        painter = painterResource(
+                            if (vpnRunning) R.drawable.ic_stop else R.drawable.ic_play
+                        ),
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = when {
+                        starting -> "Запуск…"
+                        vpnRunning -> "Выключить обходку"
+                        else -> "Включить обходку"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 1
+                )
+            }
+        } else {
+            if (starting) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(20.dp),
+                    strokeWidth = 2.dp
+                )
+            } else {
+                Icon(
+                    painter = painterResource(
+                        if (vpnRunning) R.drawable.ic_stop else R.drawable.ic_play
+                    ),
+                    contentDescription = null,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = when {
+                    starting -> "Запуск…"
+                    vpnRunning -> "Выключить обходку"
+                    else -> "Включить обходку"
+                },
+                maxLines = 1,
+                style = MaterialTheme.typography.titleSmall
+            )
+        }
+    }
+}
+
+@Composable
+private fun ProxyDockButton(
+    compact: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    FilledTonalButton(
+        onClick = onClick,
+        modifier = modifier.height(if (compact) 64.dp else 52.dp),
+        shape = CircleShape
+    ) {
+        if (compact) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Icon(
                     painter = painterResource(R.drawable.ic_copy),
                     contentDescription = null,
                     modifier = Modifier.size(20.dp)
                 )
-                Spacer(Modifier.width(10.dp))
-                Text("Данные MTProxy", style = MaterialTheme.typography.titleSmall)
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = "Данные MTProxy",
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 1
+                )
             }
+        } else {
+            Icon(
+                painter = painterResource(R.drawable.ic_copy),
+                contentDescription = null,
+                modifier = Modifier.size(20.dp)
+            )
+            Spacer(Modifier.width(8.dp))
+            Text("Данные MTProxy", maxLines = 1)
         }
     }
 }
@@ -751,89 +968,77 @@ private fun StrategySelector(
     domainListStatus: String,
     onUpdateDomainList: () -> Unit
 ) {
-    var expanded by remember { mutableStateOf(false) }
     val selected = options[selectedIndex]
 
-    // dropdown menu
-    ExposedDropdownMenuBox(
-        expanded = expanded && enabled,
-        onExpandedChange = { if (enabled) expanded = !expanded }
+    FlowRow(
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(0.dp)
     ) {
-        OutlinedTextField(
-            value = selected.title,
-            onValueChange = {},
-            readOnly = true,
-            enabled = enabled,
-            label = { Text("Стратегия") },
-            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded && enabled) },
-            shape = MaterialTheme.shapes.large,
-            modifier = Modifier
-                .fillMaxWidth()
-                .menuAnchor(androidx.compose.material3.ExposedDropdownMenuAnchorType.PrimaryNotEditable)
-        )
-        ExposedDropdownMenu(
-            expanded = expanded && enabled,
-            onDismissRequest = { expanded = false }
-        ) {
-            options.forEachIndexed { index, option ->
-                DropdownMenuItem(
-                    text = { Text(option.title, style = MaterialTheme.typography.titleSmall) },
-                    onClick = {
-                        onSelected(index)
-                        expanded = false
-                    },
-                    leadingIcon = {
+        options.forEachIndexed { index, option ->
+            FilterChip(
+                selected = index == selectedIndex,
+                onClick = { onSelected(index) },
+                enabled = enabled,
+                label = { Text(option.title) },
+                leadingIcon = if (index == selectedIndex) {
+                    {
                         Icon(
                             painter = painterResource(R.drawable.ic_check),
                             contentDescription = null,
-                            modifier = Modifier.size(18.dp),
-                            tint = if (index == selectedIndex) {
-                                MaterialTheme.colorScheme.onSurface
-                            } else {
-                                Color.Transparent
-                            }
+                            modifier = Modifier.size(18.dp)
                         )
                     }
-                )
-            }
+                } else {
+                    null
+                }
+            )
         }
     }
-    if (selected.id == StrategyProfiles.DEFAULT_ID) {
-        Spacer(Modifier.height(8.dp))
-        FilledTonalButton(
-            onClick = onUpdateDomainList,
-            enabled = !updatingDomainList && !isStarting,
-            modifier = Modifier.fillMaxWidth()
+
+    Spacer(Modifier.height(4.dp))
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.medium,
+        color = MaterialTheme.colorScheme.surfaceContainerLow
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            if (updatingDomainList) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(18.dp),
-                    strokeWidth = 2.dp
+            Text(
+                text = selected.description,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (selected.id == StrategyProfiles.DEFAULT_ID) {
+                Text(
+                    text = domainListStatus,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                Spacer(Modifier.width(10.dp))
+                FilledTonalButton(
+                    onClick = onUpdateDomainList,
+                    enabled = !updatingDomainList && !isStarting,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    if (updatingDomainList) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            strokeWidth = 2.dp
+                        )
+                        Spacer(Modifier.width(10.dp))
+                    }
+                    Text(if (updatingDomainList) "Обновление списка…" else "Обновить список")
+                }
             }
-            Text(if (updatingDomainList) "Обновление списка…" else "Обновить список")
+            if (!enabled) {
+                Text(
+                    text = "Стратегию можно сменить после выключения",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
         }
-        Text(
-            text = domainListStatus,
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(top = 6.dp)
-        )
-    }
-    Spacer(Modifier.height(8.dp))
-    Text(
-        text = selected.description,
-        style = MaterialTheme.typography.bodyMedium,
-        color = MaterialTheme.colorScheme.onSurfaceVariant
-    )
-    if (!enabled) {
-        Spacer(Modifier.height(6.dp))
-        Text(
-            text = "Стратегию можно сменить после выключения",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
     }
 }
 
@@ -850,21 +1055,22 @@ private fun LogsScreen(
     val entries by AppLog.entries.collectAsState()
     val newestFirst = entries.asReversed()
     var confirmDiagnosticExport by rememberSaveable { mutableStateOf(false) }
-    var operatorRegion by remember { mutableStateOf("") }
+    var confirmClearLogs by rememberSaveable { mutableStateOf(false) }
+    var operatorRegion by rememberSaveable { mutableStateOf("") }
     var configureTransferTest by rememberSaveable { mutableStateOf(false) }
-    var payloadKiB by remember { mutableIntStateOf(150) }
-    var idleTimeoutSeconds by remember { mutableIntStateOf(4) }
+    var payloadKiB by rememberSaveable { mutableIntStateOf(150) }
+    var idleTimeoutSeconds by rememberSaveable { mutableIntStateOf(4) }
     Column(
         Modifier
             .fillMaxSize()
-            .padding(horizontal = 24.dp)
+            .padding(horizontal = 20.dp)
     ) {
-        Spacer(Modifier.height(24.dp))
+        Spacer(Modifier.height(12.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text(
                     text = "Логи",
-                    style = MaterialTheme.typography.displaySmall,
+                    style = MaterialTheme.typography.headlineMedium,
                     fontWeight = FontWeight.SemiBold
                 )
                 Text(
@@ -884,7 +1090,7 @@ private fun LogsScreen(
             }
             Spacer(Modifier.width(8.dp))
             FilledTonalIconButton(
-                onClick = { AppLog.clear() },
+                onClick = { confirmClearLogs = true },
                 enabled = entries.isNotEmpty()
             ) {
                 Icon(
@@ -932,7 +1138,7 @@ private fun LogsScreen(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 4.dp)
         )
-        Spacer(Modifier.height(20.dp))
+        Spacer(Modifier.height(12.dp))
         if (entries.isEmpty()) {
             EmptyLogs()
         } else {
@@ -948,6 +1154,28 @@ private fun LogsScreen(
                 }
             }
         }
+        if (confirmClearLogs) {
+            AlertDialog(
+                onDismissRequest = { confirmClearLogs = false },
+                title = { Text("Очистить логи?") },
+                text = { Text("Все записи будут удалены.") },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            AppLog.clear()
+                            confirmClearLogs = false
+                        }
+                    ) {
+                        Text("Очистить")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { confirmClearLogs = false }) {
+                        Text("Отмена")
+                    }
+                }
+            )
+        }
         if (confirmDiagnosticExport) {
             AlertDialog(
                 onDismissRequest = {
@@ -960,8 +1188,10 @@ private fun LogsScreen(
                         Text(
                             text = buildAnnotatedString {
                                 append(
-                                    "В отчет войдут лишь версия приложения и устройства, тип сети, " +
-                                        "результаты калибровки и журнал приложения. Журнал может " +
+                                    "В отчет войдут версия приложения и устройства, тип сети, " +
+                                        "результаты калибровки, статистика подключений и журнал приложения. " +
+                                        "Статистика включает профили, длительность сеансов, смены сети, " +
+                                        "состояния ядра и классифицированные сетевые ошибки. Журнал может " +
                                         "содержать домены, IP-адреса и параметры соединений.\n\n" +
                                         "При указании оператора / региона, они также войдут в отчет. " +
                                         "Важно понимать, что указывать такую информацию для других " +
@@ -1181,11 +1411,11 @@ private fun EmptyLogs() {
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(top = 48.dp),
+            .padding(top = 24.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Surface(
-            modifier = Modifier.size(96.dp),
+            modifier = Modifier.size(72.dp),
             shape = CircleShape,
             color = MaterialTheme.colorScheme.surfaceContainerHigh
         ) {
@@ -1193,12 +1423,12 @@ private fun EmptyLogs() {
                 Icon(
                     painter = painterResource(R.drawable.ic_audit),
                     contentDescription = null,
-                    modifier = Modifier.size(44.dp),
+                    modifier = Modifier.size(34.dp),
                     tint = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
         }
-        Spacer(Modifier.height(20.dp))
+        Spacer(Modifier.height(12.dp))
         Text("Пока пусто", style = MaterialTheme.typography.titleMedium)
         Spacer(Modifier.height(6.dp))
         Text(
@@ -1221,13 +1451,13 @@ private fun SourceScreen() {
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
-            .padding(horizontal = 24.dp),
+            .padding(horizontal = 20.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Spacer(Modifier.height(48.dp))
+        Spacer(Modifier.height(20.dp))
         Surface(
             onClick = { uriHandler.openUri(repoUrl) },
-            modifier = Modifier.size(112.dp),
+            modifier = Modifier.size(80.dp),
             shape = RoundedCornerShape(32.dp),
             color = MaterialTheme.colorScheme.surfaceContainerHigh
         ) {
@@ -1235,12 +1465,12 @@ private fun SourceScreen() {
                 Icon(
                     painter = painterResource(R.drawable.ic_github),
                     contentDescription = "Открыть GitHub",
-                    modifier = Modifier.size(56.dp),
+                    modifier = Modifier.size(40.dp),
                     tint = MaterialTheme.colorScheme.onSurface
                 )
             }
         }
-        Spacer(Modifier.height(24.dp))
+        Spacer(Modifier.height(14.dp))
         Text(
             text = "Obhod by skytr1x",
             style = MaterialTheme.typography.headlineMedium,
@@ -1271,7 +1501,7 @@ private fun SourceScreen() {
             Spacer(Modifier.width(8.dp))
             Text("Репозиторий")
         }
-        Spacer(Modifier.height(32.dp))
+        Spacer(Modifier.height(18.dp))
         Surface(
             modifier = Modifier.widthIn(max = 640.dp),
             shape = MaterialTheme.shapes.extraLarge,

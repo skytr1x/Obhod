@@ -24,16 +24,16 @@ if (releaseSigningFile.isFile) {
 
 android {
     namespace = "com.skytr1x.obhod"
-    compileSdk = 36
-    buildToolsVersion = "36.0.0"
+    compileSdk = 37
+    buildToolsVersion = "37.0.0"
 
     defaultConfig {
         applicationId = "com.skytr1x.obhod"
         minSdk = 30
-        targetSdk = 36
+        targetSdk = 37
         ndkVersion = "27.2.12479018"
         versionCode = 1
-        versionName = "1.4.1"
+        versionName = "1.6"
 
         ndk {
             abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a", "x86_64"))
@@ -163,7 +163,7 @@ val buildRustArm64 = registerRustBuild(
     "buildTelegramRustArm64", "aarch64-linux-android", "arm64-v8a", "aarch64-linux-android30-clang"
 )
 val buildRustArm32 = registerRustBuild(
-    "buildTelegramRustArm32", "armv7-linux-androideabi", "armeabi-v7a", "armv7-linux-androideabi30-clang"
+    "buildTelegramRustArm32", "armv7-linux-androideabi", "armeabi-v7a", "armv7a-linux-androideabi30-clang"
 )
 val buildTelegramRust = tasks.register("buildTelegramRust") {
     dependsOn(buildRustArm64, buildRustArm32)

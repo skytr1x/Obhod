@@ -1,5 +1,8 @@
 package com.skytr1x.obhod.diagnostics
 
+import android.os.SystemClock
+import com.skytr1x.obhod.logging.AppLog
+
 internal data class TlsSuccessMetric(
     val strategy: String,
     val connectRttMs: Int,
@@ -12,6 +15,46 @@ internal data class TlsSuccessMetric(
 internal data class TlsSampleSummary(
     val serverHelloObserved: Int,
     val serverHelloNotObserved: Int
+)
+
+internal data class ConnectionSessionReport(
+    val requestedAt: String,
+    val profile: String,
+    val startedAt: String?,
+    val stoppedAt: String?,
+    val startupDurationMs: Long?,
+    val durationMs: Long?,
+    val outcome: String,
+    val coreTransitions: List<String>
+)
+
+internal data class ConnectionFailureCount(
+    val code: String,
+    val count: Int,
+    val summary: String
+)
+
+internal data class ConnectionHistorySummary(
+    val currentState: String,
+    val bufferEntryCount: Int,
+    val startRequests: Int,
+    val serviceStartCalls: Int,
+    val reachedVpnRunning: Int,
+    val startFailures: Int,
+    val stopRequests: Int,
+    val completedStops: Int,
+    val networkProfileChanges: Int,
+    val networkRestarts: Int,
+    val coreTransitions: Int,
+    val warningCount: Int,
+    val errorCount: Int,
+    val startupP50Ms: Long?,
+    val startupP95Ms: Long?,
+    val durationP50Ms: Long?,
+    val durationP95Ms: Long?,
+    val sessions: List<ConnectionSessionReport>,
+    val failureCounts: List<ConnectionFailureCount>,
+    val recentIssues: List<String>
 )
 
 internal data class DiagnosticReportData(
@@ -35,7 +78,10 @@ internal data class DiagnosticReportData(
     val quicSuppressionCount: Int,
     val adaptiveProfileSelected: Boolean = false,
     val adaptiveAttempts: List<String> = emptyList(),
-    val logs: List<String> = emptyList()
+    val logs: List<String> = emptyList(),
+    val connectionEntries: List<AppLog.Entry> = emptyList(),
+    val vpnRunning: Boolean = false,
+    val vpnStarting: Boolean = false
 )
 
 internal data class AdaptiveHostSummary(
@@ -78,10 +124,213 @@ internal object DiagnosticReport {
         )
 
     fun latestFailure(messages: List<String>): FailureFinding? =
-        messages.asReversed().firstNotNullOfOrNull(ConnectionFailureClassifier::fromLogMessage)
+        messages.asReversed()
+            .filter { it.startsWith("[PROBLEM]") }
+            .firstNotNullOfOrNull(ConnectionFailureClassifier::fromLogMessage)
 
     fun quicSuppressionCount(messages: List<String>): Int =
         messages.count { it.startsWith("[UDP-QUIC-BLOCK]") }
+
+    fun connectionHistory(
+        entries: List<AppLog.Entry>,
+        vpnRunning: Boolean,
+        vpnStarting: Boolean
+    ): ConnectionHistorySummary {
+        class MutableSession(
+            var requestedAt: String,
+            var requestedElapsedMs: Long,
+            var profile: String
+        ) {
+            var startedAt: String? = null
+            var startedElapsedMs: Long? = null
+            var stoppedAt: String? = null
+            var stoppedElapsedMs: Long? = null
+            var stopRequestedByUi = false
+            var startFailed = false
+            var closed = false
+            val coreTransitions = mutableListOf<String>()
+        }
+
+        val sessions = mutableListOf<MutableSession>()
+        var current: MutableSession? = null
+        var startRequests = 0
+        var serviceStartCalls = 0
+        var reachedVpnRunning = 0
+        var startFailures = 0
+        var stopRequests = 0
+        var completedStops = 0
+        var networkProfileChanges = 0
+        var networkRestarts = 0
+        var coreTransitions = 0
+
+        fun beginSession(time: String, elapsedMs: Long, profile: String): MutableSession {
+            val session = MutableSession(time, elapsedMs, profile)
+            sessions += session
+            current = session
+            return session
+        }
+
+        entries.forEach { entry ->
+            val message = entry.message
+            when {
+                entry.tag == "UI" && message.startsWith("Запуск обхода: ") -> {
+                    startRequests++
+                    if (current == null || current.closed) {
+                        beginSession(
+                            entry.time,
+                            entry.elapsedRealtimeMs,
+                            message.removePrefix("Запуск обхода: ")
+                                .substringBefore(" + Adaptive Desync Chain")
+                        )
+                    }
+                }
+
+                message.startsWith("Запуск: ") -> {
+                    serviceStartCalls++
+                    val profile = message.removePrefix("Запуск: ")
+                        .substringBefore(" + Adaptive Desync Chain")
+                    val session = current?.takeUnless { it.closed }
+                        ?: beginSession(entry.time, entry.elapsedRealtimeMs, profile)
+                    session.profile = profile
+                }
+
+                message.startsWith("Состояние ядра ") -> {
+                    coreTransitions++
+                    current?.takeUnless { it.closed }?.coreTransitions?.add(message)
+                }
+
+                entry.tag == "UI" && message == "Остановка обхода" -> {
+                    stopRequests++
+                    current?.takeUnless { it.closed }?.stopRequestedByUi = true
+                }
+
+                message.startsWith("Системный обход включён: ") -> {
+                    reachedVpnRunning++
+                    val profile = message.removePrefix("Системный обход включён: ")
+                    val session = current?.takeUnless { it.closed }
+                        ?: beginSession(entry.time, entry.elapsedRealtimeMs, profile)
+                    session.profile = profile
+                    session.startedAt = entry.time
+                    session.startedElapsedMs = entry.elapsedRealtimeMs
+                }
+
+                message.startsWith("Не удалось запустить системный обход") -> {
+                    startFailures++
+                    val session = current?.takeUnless { it.closed }
+                        ?: beginSession(entry.time, entry.elapsedRealtimeMs, "неизвестно")
+                    session.startFailed = true
+                    session.closed = true
+                    current = null
+                }
+
+                message == "Системный обход выключен" -> {
+                    completedStops++
+                    current?.takeUnless { it.closed }?.let { session ->
+                        session.stoppedAt = entry.time
+                        session.stoppedElapsedMs = entry.elapsedRealtimeMs
+                        session.closed = true
+                    }
+                    current = null
+                }
+
+                message.startsWith("Смена сетевого профиля: ") -> networkProfileChanges++
+                message.startsWith("Сеть изменилась;") -> networkRestarts++
+            }
+        }
+
+        val startupDurations = sessions.mapNotNull { session ->
+            val started = session.startedElapsedMs ?: return@mapNotNull null
+            (started - session.requestedElapsedMs).takeIf { it >= 0L }
+        }
+        val completedDurations = sessions.mapNotNull { session ->
+            val started = session.startedElapsedMs ?: return@mapNotNull null
+            val stopped = session.stoppedElapsedMs ?: return@mapNotNull null
+            (stopped - started).takeIf { it >= 0L }
+        }
+        val now = SystemClock.elapsedRealtime()
+        val sessionReports = sessions.map { session ->
+            val isCurrent = session === current && !session.closed
+            val activeDuration = if (
+                isCurrent && vpnRunning && session.startedElapsedMs != null
+            ) {
+                (now - session.startedElapsedMs!!).coerceAtLeast(0L)
+            } else {
+                null
+            }
+            val stoppedDuration = if (
+                session.startedElapsedMs != null && session.stoppedElapsedMs != null
+            ) {
+                (session.stoppedElapsedMs!! - session.startedElapsedMs!!)
+                    .takeIf { it >= 0L }
+            } else {
+                null
+            }
+            val outcome = when {
+                session.startFailed -> "ошибка запуска"
+                session.stoppedAt != null && session.stopRequestedByUi -> "остановлен по команде"
+                session.stoppedAt != null -> "остановлен"
+                isCurrent && vpnStarting -> "запускается"
+                isCurrent && vpnRunning -> "активен"
+                else -> "нет завершения в буфере"
+            }
+            ConnectionSessionReport(
+                requestedAt = session.requestedAt,
+                profile = session.profile,
+                startedAt = session.startedAt,
+                stoppedAt = session.stoppedAt,
+                startupDurationMs = session.startedElapsedMs
+                    ?.minus(session.requestedElapsedMs)
+                    ?.takeIf { it >= 0L },
+                durationMs = stoppedDuration ?: activeDuration,
+                outcome = outcome,
+                coreTransitions = session.coreTransitions.toList()
+            )
+        }
+
+        val failureCounts = entries.asSequence()
+            .map { it.message }
+            .filter { it.startsWith("[PROBLEM]") }
+            .mapNotNull(ConnectionFailureClassifier::fromLogMessage)
+            .groupBy { it.code }
+            .map { (code, findings) ->
+                ConnectionFailureCount(
+                    code = code,
+                    count = findings.size,
+                    summary = findings.first().summary
+                )
+            }
+            .sortedWith(compareByDescending<ConnectionFailureCount> { it.count }.thenBy { it.code })
+
+        return ConnectionHistorySummary(
+            currentState = when {
+                vpnStarting -> "запускается"
+                vpnRunning -> "активен"
+                else -> "выключен"
+            },
+            bufferEntryCount = entries.size,
+            startRequests = startRequests,
+            serviceStartCalls = serviceStartCalls,
+            reachedVpnRunning = reachedVpnRunning,
+            startFailures = startFailures,
+            stopRequests = stopRequests,
+            completedStops = completedStops,
+            networkProfileChanges = networkProfileChanges,
+            networkRestarts = networkRestarts,
+            coreTransitions = coreTransitions,
+            warningCount = entries.count { it.level == 'W' },
+            errorCount = entries.count { it.level == 'E' },
+            startupP50Ms = percentile(startupDurations, 50),
+            startupP95Ms = percentile(startupDurations, 95),
+            durationP50Ms = percentile(completedDurations, 50),
+            durationP95Ms = percentile(completedDurations, 95),
+            sessions = sessionReports,
+            failureCounts = failureCounts,
+            recentIssues = entries
+                .filter { it.level == 'W' || it.level == 'E' }
+                .takeLast(10)
+                .map { "${it.time} ${it.level}/${it.tag}: ${it.message}" }
+        )
+    }
 
     fun adaptiveSummary(messages: List<String>): AdaptiveSummary {
         class MutableHost {
@@ -194,6 +443,88 @@ internal object DiagnosticReport {
         appendLine("Сравнение DNS: ${data.dnsComparison.reportSafe()}")
         appendLine("Интерпретация DNS: ${dnsInterpretation(data.dnsComparison)}")
         appendLine("Выбранный профиль: ${data.selectedProfile.reportSafe()}")
+
+        val connectionHistory = connectionHistory(
+            entries = data.connectionEntries,
+            vpnRunning = data.vpnRunning,
+            vpnStarting = data.vpnStarting
+        )
+        appendLine("Текущее состояние VPN: ${connectionHistory.currentState}")
+        appendLine(
+            "История подключений: ${connectionHistory.bufferEntryCount}/${AppLog.MAX_ENTRIES} " +
+                "последних записей в памяти"
+        )
+        appendLine(
+            "Запуски из интерфейса: ${connectionHistory.startRequests}; " +
+                "вызовы сервиса: ${connectionHistory.serviceStartCalls}; " +
+                "достигли состояния VPN active: ${connectionHistory.reachedVpnRunning}; " +
+                "ошибки старта: ${connectionHistory.startFailures}"
+        )
+        appendLine(
+            "Остановки: запросов ${connectionHistory.stopRequests}; " +
+                "подтверждено журналом ${connectionHistory.completedStops}"
+        )
+        appendLine(
+            "Время запуска до VPN active: p50 " +
+                "${connectionHistory.startupP50Ms?.let { "$it ms" } ?: "нет данных"}, p95 " +
+                "${connectionHistory.startupP95Ms?.let { "$it ms" } ?: "нет данных"}"
+        )
+        appendLine(
+            "Длительность завершённых VPN-сессий: p50 " +
+                "${connectionHistory.durationP50Ms?.let { "$it ms" } ?: "нет данных"}, p95 " +
+                "${connectionHistory.durationP95Ms?.let { "$it ms" } ?: "нет данных"}"
+        )
+        appendLine(
+            "Сетевые перенастройки: смена профиля " +
+                "${connectionHistory.networkProfileChanges}; перезапуски из-за сети " +
+                "${connectionHistory.networkRestarts}"
+        )
+        appendLine(
+            "Переходы ядра: ${connectionHistory.coreTransitions}; " +
+                "предупреждения: ${connectionHistory.warningCount}; " +
+                "ошибки приложения: ${connectionHistory.errorCount}"
+        )
+        if (connectionHistory.sessions.isEmpty()) {
+            appendLine("Сеансы VPN: нет записей в текущем буфере")
+        } else {
+            appendLine("Последние сеансы VPN:")
+            connectionHistory.sessions.takeLast(8).forEach { session ->
+                val activation = session.startedAt ?: "не дошёл до active"
+                val stopped = session.stoppedAt?.let { " → $it" }.orEmpty()
+                val startup = session.startupDurationMs?.let { ", запуск ${it} ms" }.orEmpty()
+                val duration = session.durationMs?.let { ", ${it} ms" }.orEmpty()
+                val core = session.coreTransitions
+                    .map { it.removePrefix("Состояние ядра ") }
+                    .joinToString(" → ")
+                    .ifBlank { "нет событий ядра" }
+                appendLine(
+                    "  ${session.requestedAt} ${session.profile.reportSafe()}: " +
+                        "$activation$stopped$startup$duration; ${session.outcome}; ядро: ${core.reportSafe()}"
+                )
+            }
+        }
+        if (connectionHistory.failureCounts.isEmpty()) {
+            appendLine(
+                "Классифицированные сетевые ошибки: событий [PROBLEM] нет; " +
+                    "это не подтверждает доступность всех удалённых сервисов."
+            )
+        } else {
+            appendLine("Классифицированные сетевые события [PROBLEM]:")
+            connectionHistory.failureCounts.forEach { failureCount ->
+                appendLine(
+                    "  ${failureCount.code}: ${failureCount.count}; " +
+                        failureCount.summary.reportSafe()
+                )
+            }
+        }
+        if (connectionHistory.recentIssues.isNotEmpty()) {
+            appendLine("Последние предупреждения и ошибки приложения:")
+            connectionHistory.recentIssues.forEach { appendLine("  ${it.logSafe()}") }
+        }
+        appendLine(
+            "История ограничена текущим буфером приложения (до ${AppLog.MAX_ENTRIES} записей); " +
+                "после очистки или перезапуска старые записи недоступны."
+        )
         appendLine(
             "Adaptive Desync Chain: " +
                 if (data.adaptiveProfileSelected) "профиль выбран" else "профиль не выбран"

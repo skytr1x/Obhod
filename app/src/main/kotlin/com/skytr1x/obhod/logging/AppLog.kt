@@ -2,6 +2,7 @@ package com.skytr1x.obhod.logging
 
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import java.util.ArrayDeque
 import java.time.LocalTime
@@ -18,12 +19,13 @@ object AppLog {
         val time: String,
         val level: Char,
         val tag: String,
-        val message: String
+        val message: String,
+        val elapsedRealtimeMs: Long
     ) {
         fun asLine(): String = "$time ${level}/$tag: $message"
     }
 
-    private const val MAX_ENTRIES = 400
+    internal const val MAX_ENTRIES = 400
     private const val MAX_MESSAGE = 2000
     private const val PUBLISH_INTERVAL_MS = 250L
     private val clock = DateTimeFormatter.ofPattern("HH:mm:ss", Locale.ROOT)
@@ -74,7 +76,8 @@ object AppLog {
             time = LocalTime.now().format(clock),
             level = level,
             tag = tag.take(24),
-            message = message.take(MAX_MESSAGE)
+            message = message.take(MAX_MESSAGE),
+            elapsedRealtimeMs = SystemClock.elapsedRealtime()
         )
         synchronized(entriesLock) {
             if (history.size == MAX_ENTRIES) history.removeFirst()
