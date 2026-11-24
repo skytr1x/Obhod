@@ -456,6 +456,11 @@ class MainActivity : AppCompatActivity() {
         val zapretPrefs = getSharedPreferences("zapret", MODE_PRIVATE)
         vpnRunning = zapretPrefs.getBoolean("running", false)
         starting = zapretPrefs.getBoolean("starting", false)
+        val error = zapretPrefs.getString("last_error", null)
+        if (!error.isNullOrBlank()) {
+            zapretPrefs.edit().remove("last_error").apply()
+            Toast.makeText(this, error, Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun requestVpnAndStart() {
@@ -470,6 +475,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun continueVpnAndStart() {
+        val option = StrategyProfiles.options.getOrNull(selectedStrategyIndex)
+        if (option?.id == StrategyProfiles.SULINUX_ID) {
+            startObhod()
+            return
+        }
         val prepareIntent = VpnService.prepare(this)
         if (prepareIntent != null) {
             vpnPermissionLauncher.launch(prepareIntent)

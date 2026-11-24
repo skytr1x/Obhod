@@ -13,6 +13,7 @@ object StrategyProfiles {
     const val DEFAULT_ID = "list"
     const val ADAPTIVE_ID = "adaptive-desync-chain"
     const val ADAPTIVE_PREF = "adaptive_chain"
+    const val SULINUX_ID = "sulinux"
 
     val options = listOf(
         StrategyProfileOption(
@@ -39,6 +40,13 @@ object StrategyProfiles {
             "split-sni-mobile",
             "Split SNI",
             "Сначала разрез перед SNI, затем разрез после первого байта. Без fake-пакетов TCP."
+        ),
+        StrategyProfileOption(
+            SULINUX_ID,
+            "SULinux",
+            "Ядерный обход: root-демон и правила nftables/iptables перенаправляют TCP 80/443 " +
+                "и убирают QUIC, VPN не нужен. Требуется root — KernelSU (модуль ставится " +
+                "автоматически) или временный DFRoot."
         )
     )
 

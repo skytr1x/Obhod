@@ -3,6 +3,8 @@ package com.skytr1x.obhod.strategy
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class StrategyProfilesTest {
@@ -41,5 +43,17 @@ class StrategyProfilesTest {
         assertEquals("base-split", strategies.getJSONObject(1).getString("id"))
         assertEquals("blocked.example", merged.getJSONArray("include").getString(0))
         assertFalse(merged.getBoolean("direct_ru"))
+    }
+
+    @Test
+    fun sulinuxIsASelectableKernelStrategy() {
+        val option = StrategyProfiles.options.firstOrNull {
+            it.id == StrategyProfiles.SULINUX_ID
+        }
+        assertNotNull(option)
+        assertEquals("SULinux", option?.title)
+        assertEquals("SULinux", StrategyProfiles.label(StrategyProfiles.SULINUX_ID))
+        assertTrue(option?.description.orEmpty().contains("root"))
+        assertTrue(option?.description.orEmpty().contains("KernelSU"))
     }
 }

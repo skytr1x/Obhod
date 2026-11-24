@@ -435,6 +435,9 @@ private fun HomeScreen(
 ) {
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val useTwoPaneLayout = maxWidth >= 840.dp
+        val kernelMode =
+            StrategyProfiles.options.getOrNull(selectedStrategyIndex)?.id ==
+                StrategyProfiles.SULINUX_ID
 
         Column(
             modifier = Modifier
@@ -472,7 +475,8 @@ private fun HomeScreen(
                                 onStrategySelected = onStrategySelected,
                                 updatingDomainList = updatingDomainList,
                                 domainListStatus = domainListStatus,
-                                onUpdateDomainList = onUpdateDomainList
+                                onUpdateDomainList = onUpdateDomainList,
+                                kernelMode = kernelMode
                             )
                         }
                         Column(Modifier.weight(1f)) {
@@ -481,7 +485,8 @@ private fun HomeScreen(
                                 switchEnabled = !vpnRunning && !starting,
                                 onAdaptiveChainChanged = onAdaptiveChainChanged,
                                 batteryOptimizationIgnored = batteryOptimizationIgnored,
-                                onRequestBatteryOptimization = onRequestBatteryOptimization
+                                onRequestBatteryOptimization = onRequestBatteryOptimization,
+                                kernelMode = kernelMode
                             )
                         }
                     }
@@ -494,7 +499,8 @@ private fun HomeScreen(
                         onStrategySelected = onStrategySelected,
                         updatingDomainList = updatingDomainList,
                         domainListStatus = domainListStatus,
-                        onUpdateDomainList = onUpdateDomainList
+                        onUpdateDomainList = onUpdateDomainList,
+                        kernelMode = kernelMode
                     )
                     Spacer(Modifier.height(10.dp))
                     AdditionalSettings(
@@ -502,7 +508,8 @@ private fun HomeScreen(
                         switchEnabled = !vpnRunning && !starting,
                         onAdaptiveChainChanged = onAdaptiveChainChanged,
                         batteryOptimizationIgnored = batteryOptimizationIgnored,
-                        onRequestBatteryOptimization = onRequestBatteryOptimization
+                        onRequestBatteryOptimization = onRequestBatteryOptimization,
+                        kernelMode = kernelMode
                     )
                 }
                 Spacer(Modifier.height(20.dp))
@@ -520,9 +527,10 @@ private fun ConnectionSetup(
     onStrategySelected: (Int) -> Unit,
     updatingDomainList: Boolean,
     domainListStatus: String,
-    onUpdateDomainList: () -> Unit
+    onUpdateDomainList: () -> Unit,
+    kernelMode: Boolean
 ) {
-    StatusSummary(vpnRunning = vpnRunning, starting = starting)
+    StatusSummary(vpnRunning = vpnRunning, starting = starting, kernelMode = kernelMode)
     Spacer(Modifier.height(16.dp))
     Text(
         text = "Стратегии",
@@ -547,13 +555,15 @@ private fun AdditionalSettings(
     switchEnabled: Boolean,
     onAdaptiveChainChanged: (Boolean) -> Unit,
     batteryOptimizationIgnored: Boolean,
-    onRequestBatteryOptimization: () -> Unit
+    onRequestBatteryOptimization: () -> Unit,
+    kernelMode: Boolean
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         AdaptiveChainCard(
             enabled = adaptiveChainEnabled,
-            switchEnabled = switchEnabled,
-            onEnabledChange = onAdaptiveChainChanged
+            switchEnabled = switchEnabled && !kernelMode,
+            onEnabledChange = onAdaptiveChainChanged,
+            kernelMode = kernelMode
         )
         QuickSettingsCard()
         BatterySettingsCard(
@@ -567,7 +577,8 @@ private fun AdditionalSettings(
 private fun AdaptiveChainCard(
     enabled: Boolean,
     switchEnabled: Boolean,
-    onEnabledChange: (Boolean) -> Unit
+    onEnabledChange: (Boolean) -> Unit,
+    kernelMode: Boolean
 ) {
     val titleColor = if (switchEnabled) {
         MaterialTheme.colorScheme.onSurface
@@ -606,8 +617,12 @@ private fun AdaptiveChainCard(
                 )
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    text = "Экспериментально: полный перебор P1–P9, затем запасная тактика " +
-                        "выбранного профиля.",
+                    text = if (kernelMode) {
+                        "В SULinux перебор P1–P9 встроен в root-демон и работает без VPN."
+                    } else {
+                        "Экспериментально: полный перебор P1–P9, затем запасная тактика " +
+                            "выбранного профиля."
+                    },
                     style = MaterialTheme.typography.bodyMedium,
                     color = supportingColor
                 )
@@ -746,16 +761,20 @@ private fun BatterySettingsCard(
 @Composable
 private fun StatusSummary(
     vpnRunning: Boolean,
-    starting: Boolean
+    starting: Boolean,
+    kernelMode: Boolean
 ) {
     val title = when {
         starting -> "Запуск обхода…"
+        vpnRunning && kernelMode -> "SULinux активен"
         vpnRunning -> "Обход включен"
         else -> "Обход выключен"
     }
     val subtitle = when {
-        starting -> "Старт системы..."
+        starting -> if (kernelMode) "Проверка root и установка модуля..." else "Старт системы..."
+        vpnRunning && kernelMode -> "Root-демон и правила nftables/iptables работают без VPN"
         vpnRunning -> "Системный обход и MTProxy работают"
+        kernelMode -> "Нужен root: KernelSU или временный DFRoot. Модуль ставится автоматически"
         else -> "Выберите стратегию и включите обход"
     }
 
@@ -1030,6 +1049,15 @@ private fun StrategySelector(
                     }
                     Text(if (updatingDomainList) "Обновление списка…" else "Обновить список")
                 }
+            }
+            if (selected.id == StrategyProfiles.SULINUX_ID) {
+                Text(
+                    text = "При включении приложение само установит KernelSU-модуль и " +
+                        "активирует правила без перезагрузки. Если KernelSU нет, используется " +
+                        "прямой root-режим (DFRoot).",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
             if (!enabled) {
                 Text(

@@ -34,7 +34,8 @@ public:
     ~Socks5Server();
 
     bool start(uint16_t port, StrategySelector* selector, ProtectorCallback protector,
-               EventCallback event = nullptr, DnsResolverCallback dnsResolver = nullptr);
+               EventCallback event = nullptr, DnsResolverCallback dnsResolver = nullptr,
+               bool transparent = false);
     void stop();
 
     bool isRunning() const { return m_running.load(); }
@@ -88,13 +89,14 @@ private:
         std::shared_ptr<DnsRelayState> relay;
     };
 
-    void acceptLoop();
+    void acceptLoop(int listenFd);
     bool startDnsWorkers();
     void stopDnsWorkers();
     void dnsWorkerLoop();
     void processDnsWork(DnsWork work);
     void handleClient(int clientFd);
-    void handleConnect(int clientFd, const Request& request);
+    void handleTransparentClient(int clientFd, const std::string& host, uint16_t port);
+    void handleConnect(int clientFd, const Request& request, bool transparent = false);
     void handleDnsConnect(int clientFd, const Request& request);
     void handleUdpAssociate(int clientFd, const Request& request);
 
@@ -131,6 +133,8 @@ private:
     void recordScopedAnswers(const std::vector<std::uint8_t>& response);
 
     int m_listenFd = -1;
+    int m_listenFd6 = -1;
+    bool m_transparent = false;
     uint16_t m_port = 0;
     StrategySelector* m_selector = nullptr;
     ProtectorCallback m_protector;
@@ -144,6 +148,7 @@ private:
 
     std::atomic<bool> m_running{false};
     std::thread m_acceptThread;
+    std::thread m_acceptThread6;
     std::mutex m_connectionMutex;
     std::set<int> m_connections;
     std::mutex m_scopeMutex;

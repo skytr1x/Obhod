@@ -24,6 +24,7 @@ import com.skytr1x.obhod.proxy.NativeTelegramProxy
 import com.skytr1x.obhod.proxy.TelegramProxyConfig
 import com.skytr1x.obhod.strategy.DomainListRepository
 import com.skytr1x.obhod.strategy.StrategyProfiles
+import com.skytr1x.obhod.sulinux.SULinuxManager
 import java.io.File
 import java.net.Inet6Address
 import java.net.InetAddress
@@ -46,6 +47,7 @@ class ZapretVpnService : VpnService(), NativeBridge.Protector, NativeBridge.List
     @Volatile private var nativeHandle = 0L
     @Volatile private var vpnInterface: ParcelFileDescriptor? = null
     @Volatile private var telegramProxyStarted = false
+    @Volatile private var sulinuxActive = false
     @Volatile private var starting = false
     @Volatile private var stopRequested = false
     @Volatile private var networkCallbackRegistered = false
@@ -81,12 +83,16 @@ class ZapretVpnService : VpnService(), NativeBridge.Protector, NativeBridge.List
             stopRequested = true
             starting = false
             vpnExecutor.execute {
+                deactivateSulinuxIfNeeded()
                 shutdown()
                 stopSelf()
             }
             return START_NOT_STICKY
         }
         if (intent?.action == ACTION_RELOAD_LIST) {
+            if (currentProfile() == StrategyProfiles.SULINUX_ID) {
+                return START_STICKY
+            }
             if (currentProfile() != StrategyProfiles.DEFAULT_ID ||
                 nativeHandle == 0L || starting
             ) {
@@ -107,7 +113,9 @@ class ZapretVpnService : VpnService(), NativeBridge.Protector, NativeBridge.List
             }
             return START_STICKY
         }
-        if (nativeHandle != 0L || vpnInterface != null || starting) return START_STICKY
+        if (nativeHandle != 0L || vpnInterface != null || starting || sulinuxActive) {
+            return START_STICKY
+        }
 
         val profileId = intent?.getStringExtra(EXTRA_PROFILE)
             ?: getSharedPreferences("zapret", MODE_PRIVATE)
@@ -126,12 +134,44 @@ class ZapretVpnService : VpnService(), NativeBridge.Protector, NativeBridge.List
         starting = true
         vpnExecutor.execute {
             try {
-                startVpn(profileId)
+                if (profileId == StrategyProfiles.SULINUX_ID) startSulinux(profileId)
+                else startVpn(profileId)
             } finally {
                 starting = false
             }
         }
         return START_STICKY
+    }
+
+    private fun startSulinux(profileId: String) {
+        sulinuxActive = true
+        getSharedPreferences("zapret", MODE_PRIVATE).edit()
+            .remove("last_error")
+            .apply()
+        AppLog.i(TAG, "Запуск SULinux: root-демон и ядерные правила, без VPN")
+        val outcome = SULinuxManager.activate(this)
+        if (!outcome.ok) {
+            AppLog.e(TAG, "SULinux не запустился: ${outcome.message}")
+            sulinuxActive = false
+            shutdown()
+            stopForeground(STOP_FOREGROUND_DETACH)
+            getSharedPreferences("zapret", MODE_PRIVATE).edit()
+                .putString("last_error", outcome.message)
+                .apply()
+            publishState(false, profileId)
+            stopSelf()
+            return
+        }
+        AppLog.i(TAG, outcome.message)
+        publishState(true, profileId)
+    }
+
+    private fun deactivateSulinuxIfNeeded() {
+        if (!sulinuxActive) return
+        sulinuxActive = false
+        val outcome = SULinuxManager.deactivate(this)
+        if (outcome.ok) AppLog.i(TAG, outcome.message)
+        else AppLog.w(TAG, outcome.message)
     }
 
     private fun startVpn(profileId: String) {
@@ -765,6 +805,7 @@ misc:
     override fun onRevoke() {
         stopRequested = true
         vpnExecutor.execute {
+            deactivateSulinuxIfNeeded()
             shutdown()
             stopSelf()
         }

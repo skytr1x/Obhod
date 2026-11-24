@@ -172,6 +172,79 @@ tasks.named("preBuild").configure {
     dependsOn(buildTelegramRust)
 }
 
+val sulinuxCoreDir = rootProject.file("core")
+val sulinuxAssetsDir = layout.buildDirectory.dir("generated/sulinux/assets")
+
+android.sourceSets.getByName("main").assets.srcDir(sulinuxAssetsDir.get().asFile)
+
+val sulinuxSources = listOf(
+    "src/sulinux/main.cpp",
+    "src/socks/socks5_server.cpp",
+    "src/desync/desync_engine.cpp",
+    "src/desync/tls_utils.cpp",
+    "src/strategy/fake_payloads.cpp",
+    "src/strategy/profile.cpp",
+    "src/strategy/strategy_selector.cpp",
+    "src/util/host_list.cpp",
+    "src/util/json.cpp"
+)
+
+fun registerSulinuxBuild(name: String, abi: String, clangName: String) =
+    tasks.register<Exec>(name) {
+        val ndkDir = androidComponents.sdkComponents.ndkDirectory.get().asFile
+        val ndkBinDir = ndkDir.resolve("toolchains/llvm/prebuilt/${
+            when {
+                System.getProperty("os.name").lowercase().contains("win") -> "windows-x86_64"
+                System.getProperty("os.name").lowercase().contains("mac") -> "darwin-x86_64"
+                else -> "linux-x86_64"
+            }
+        }/bin")
+        val clang = ndkBinDir.resolve(clangName + if (System.getProperty("os.name").lowercase().contains("win")) ".cmd" else "")
+        val includeDir = sulinuxCoreDir.resolve("include")
+        val sources = sulinuxSources.map { sulinuxCoreDir.resolve(it) }
+        val output = sulinuxAssetsDir.get().dir("sulinux/bin/$abi/sulinux").asFile
+
+        inputs.files(sources)
+        inputs.dir(includeDir)
+        outputs.file(output)
+        workingDir(sulinuxCoreDir)
+        doFirst { output.parentFile.mkdirs() }
+        commandLine(buildList {
+            add(clang.absolutePath)
+            addAll(
+                listOf(
+                    "-std=c++17", "-O2", "-s", "-fPIE", "-pie",
+                    "-D_GNU_SOURCE=1", "-DSKY_HOST_BUILD=1",
+                    "-Wall", "-Wextra", "-Wno-unused-parameter",
+                    "-ffunction-sections", "-fdata-sections",
+                    "-Wl,--gc-sections", "-Wl,-z,max-page-size=16384",
+                    "-static-libstdc++", "-pthread",
+                    "-I", includeDir.absolutePath
+                )
+            )
+            sources.forEach { add(it.absolutePath) }
+            add("-o")
+            add(output.absolutePath)
+            add("-latomic")
+        })
+    }
+
+val buildSulinuxArm64 = registerSulinuxBuild(
+    "buildSulinuxArm64", "arm64-v8a", "aarch64-linux-android30-clang++"
+)
+val buildSulinuxArm32 = registerSulinuxBuild(
+    "buildSulinuxArm32", "armeabi-v7a", "armv7a-linux-androideabi30-clang++"
+)
+val buildSulinuxX64 = registerSulinuxBuild(
+    "buildSulinuxX64", "x86_64", "x86_64-linux-android30-clang++"
+)
+val buildSulinux = tasks.register("buildSulinux") {
+    dependsOn(buildSulinuxArm64, buildSulinuxArm32, buildSulinuxX64)
+}
+tasks.named("preBuild").configure {
+    dependsOn(buildSulinux)
+}
+
 dependencies {
     implementation(platform("androidx.compose:compose-bom:2026.09.00"))
     implementation("androidx.core:core-ktx:1.19.1")

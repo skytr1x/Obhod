@@ -29,6 +29,13 @@
 #include "sky_log.h"
 #include "tls_utils.h"
 
+#ifndef SO_ORIGINAL_DST
+#define SO_ORIGINAL_DST 80
+#endif
+#ifndef IP6T_SO_ORIGINAL_DST
+#define IP6T_SO_ORIGINAL_DST 80
+#endif
+
 namespace skyunblock {
 
 namespace {
@@ -66,6 +73,32 @@ constexpr std::size_t kMaxUdpPeers = 64;
 
 std::atomic<uint64_t> g_nextTcpRequestId{1};
 thread_local uint64_t g_tcpRequestId = 0;
+
+bool readOriginalDestination(int fd, std::string& host, uint16_t& port) {
+    struct sockaddr_storage storage {};
+    socklen_t length = sizeof(storage);
+    if (::getsockopt(fd, SOL_IP, SO_ORIGINAL_DST, &storage, &length) == 0 &&
+        storage.ss_family == AF_INET) {
+        const auto* addr = reinterpret_cast<const struct sockaddr_in*>(&storage);
+        char text[INET_ADDRSTRLEN] {};
+        if (!::inet_ntop(AF_INET, &addr->sin_addr, text, sizeof(text))) return false;
+        host = text;
+        port = ntohs(addr->sin_port);
+        return port != 0 && host != "127.0.0.1";
+    }
+
+    length = sizeof(storage);
+    if (::getsockopt(fd, SOL_IPV6, IP6T_SO_ORIGINAL_DST, &storage, &length) == 0 &&
+        storage.ss_family == AF_INET6) {
+        const auto* addr = reinterpret_cast<const struct sockaddr_in6*>(&storage);
+        char text[INET6_ADDRSTRLEN] {};
+        if (!::inet_ntop(AF_INET6, &addr->sin6_addr, text, sizeof(text))) return false;
+        host = text;
+        port = ntohs(addr->sin6_port);
+        return port != 0;
+    }
+    return false;
+}
 
 class TcpRequestLogScope {
 public:
@@ -596,13 +629,14 @@ bool Socks5Server::shouldLogHost(const std::string& host) {
 
 bool Socks5Server::start(uint16_t port, StrategySelector* selector,
                          ProtectorCallback protector, EventCallback event,
-                         DnsResolverCallback dnsResolver) {
+                         DnsResolverCallback dnsResolver, bool transparent) {
     if (m_running.load()) return true;
 
     m_selector = selector;
     m_protector = std::move(protector);
     m_event = std::move(event);
     m_dnsResolver = std::move(dnsResolver);
+    m_transparent = transparent;
     {
         std::lock_guard<std::mutex> lock(m_eventMutex);
         m_lastEventLog.clear();
@@ -637,24 +671,63 @@ bool Socks5Server::start(uint16_t port, StrategySelector* selector,
         return false;
     }
 
+    if (transparent) {
+        m_listenFd6 = ::socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+        if (m_listenFd6 >= 0) {
+            int v6only = 1;
+            ::setsockopt(m_listenFd6, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+            ::setsockopt(m_listenFd6, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+            struct sockaddr_in6 addr6 {};
+            addr6.sin6_family = AF_INET6;
+            addr6.sin6_port = htons(port);
+            addr6.sin6_addr = in6addr_loopback;
+            if (::bind(m_listenFd6, reinterpret_cast<struct sockaddr*>(&addr6),
+                       sizeof(addr6)) < 0 ||
+                ::listen(m_listenFd6, 32) < 0) {
+                SKY_LOGW("SOCKS5: IPv6 transparent listener on [::1]:%u failed: %s",
+                         port, std::strerror(errno));
+                ::close(m_listenFd6);
+                m_listenFd6 = -1;
+            }
+        }
+    }
+
     if (!startDnsWorkers()) {
         ::close(m_listenFd);
         m_listenFd = -1;
+        if (m_listenFd6 >= 0) {
+            ::close(m_listenFd6);
+            m_listenFd6 = -1;
+        }
         return false;
     }
 
     m_running = true;
     try {
-        m_acceptThread = std::thread(&Socks5Server::acceptLoop, this);
+        m_acceptThread = std::thread(&Socks5Server::acceptLoop, this, m_listenFd);
+        if (m_listenFd6 >= 0) {
+            m_acceptThread6 = std::thread(&Socks5Server::acceptLoop, this, m_listenFd6);
+        }
     } catch (const std::system_error& error) {
         m_running = false;
         stopDnsWorkers();
-        ::close(m_listenFd);
-        m_listenFd = -1;
+        if (m_listenFd >= 0) {
+            ::shutdown(m_listenFd, SHUT_RDWR);
+            ::close(m_listenFd);
+            m_listenFd = -1;
+        }
+        if (m_listenFd6 >= 0) {
+            ::shutdown(m_listenFd6, SHUT_RDWR);
+            ::close(m_listenFd6);
+            m_listenFd6 = -1;
+        }
+        if (m_acceptThread.joinable()) m_acceptThread.join();
         SKY_LOGE("SOCKS5: could not start accept thread: %s", error.what());
         return false;
     }
-    SKY_LOGI("SOCKS5: listening on 127.0.0.1:%u", port);
+    SKY_LOGI("SOCKS5: listening on 127.0.0.1:%u%s", port,
+             m_listenFd6 >= 0 ? " and [::1]" : "");
     return true;
 }
 
@@ -742,8 +815,14 @@ void Socks5Server::stop() {
             ::close(m_listenFd);
             m_listenFd = -1;
         }
+        if (m_listenFd6 >= 0) {
+            ::shutdown(m_listenFd6, SHUT_RDWR);
+            ::close(m_listenFd6);
+            m_listenFd6 = -1;
+        }
 
         if (m_acceptThread.joinable()) m_acceptThread.join();
+        if (m_acceptThread6.joinable()) m_acceptThread6.join();
 
         {
             std::lock_guard<std::mutex> lock(m_connectionMutex);
@@ -760,9 +839,9 @@ void Socks5Server::stop() {
     if (wasRunning) SKY_LOGI("SOCKS5: stopped");
 }
 
-void Socks5Server::acceptLoop() {
+void Socks5Server::acceptLoop(int listenFd) {
     while (m_running.load()) {
-        struct pollfd pfd{m_listenFd, POLLIN, 0};
+        struct pollfd pfd{listenFd, POLLIN, 0};
         int pollResult;
         do {
             pollResult = ::poll(&pfd, 1, 200);
@@ -776,9 +855,9 @@ void Socks5Server::acceptLoop() {
         }
         if (!(pfd.revents & POLLIN)) continue;
 
-        struct sockaddr_in clientAddr{};
+        struct sockaddr_storage clientAddr {};
         socklen_t addrLen = sizeof(clientAddr);
-        const int clientFd = ::accept4(m_listenFd,
+        const int clientFd = ::accept4(listenFd,
                                        reinterpret_cast<struct sockaddr*>(&clientAddr),
                                        &addrLen, SOCK_CLOEXEC);
         if (clientFd < 0) {
@@ -794,7 +873,16 @@ void Socks5Server::acceptLoop() {
             break;
         }
 
-        if (m_activeConnections.load() >= MAX_CONNECTIONS) {
+        std::string originalHost;
+        uint16_t originalPort = 0;
+        if (m_transparent &&
+            !readOriginalDestination(clientFd, originalHost, originalPort)) {
+            SKY_LOGW("SULinux: could not read original destination for redirected client");
+            ::close(clientFd);
+            continue;
+        }
+
+        if (m_activeConnections.load() >= (m_transparent ? 256 : MAX_CONNECTIONS)) {
             SKY_LOGW("SOCKS5: connection limit reached, dropping client");
             ::close(clientFd);
             continue;
@@ -803,12 +891,26 @@ void Socks5Server::acceptLoop() {
         m_totalConnections.fetch_add(1);
         m_activeConnections.fetch_add(1);
         trackFd(clientFd);
-        std::thread([this, clientFd]() {
-            handleClient(clientFd);
+        std::thread([this, clientFd, originalHost, originalPort]() {
+            if (m_transparent) {
+                handleTransparentClient(clientFd, originalHost, originalPort);
+            } else {
+                handleClient(clientFd);
+            }
             closeTrackedFd(clientFd);
             m_activeConnections.fetch_sub(1);
         }).detach();
     }
+}
+
+void Socks5Server::handleTransparentClient(int clientFd, const std::string& host,
+                                            uint16_t port) {
+    setIoTimeout(clientFd, kFirstPayloadTimeoutMs / 1000);
+    Request request;
+    request.command = SOCKS5_CMD_CONNECT;
+    request.host = host;
+    request.port = port;
+    handleConnect(clientFd, request, true);
 }
 
 void Socks5Server::handleClient(int clientFd) {
@@ -1189,8 +1291,8 @@ bool Socks5Server::waitForResponse(int fd, int timeoutMs, bool& readable,
     return false;
 }
 
-void Socks5Server::handleConnect(int clientFd, const Request& request) {
-    if (request.port == 53 && m_dnsResolver) {
+void Socks5Server::handleConnect(int clientFd, const Request& request, bool transparent) {
+    if (!transparent && request.port == 53 && m_dnsResolver) {
         handleDnsConnect(clientFd, request);
         return;
     }
@@ -1233,7 +1335,7 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
             }
         }
         SKY_LOGW("SOCKS5: CONNECT %s failed: %s", target.c_str(), error.c_str());
-        sendReply(clientFd, SOCKS5_REP_HOST_UNREACHABLE);
+        if (!transparent) sendReply(clientFd, SOCKS5_REP_HOST_UNREACHABLE);
         return;
     }
     trackFd(remoteFd);
@@ -1245,7 +1347,7 @@ void Socks5Server::handleConnect(int clientFd, const Request& request) {
 
     emitEvent("[CONNECTION-STAGE] stage=proxy_connected remote_ip=%s connect_rtt_ms=%d",
               connectedIp().c_str(), connectRttMs);
-    if (!sendReply(clientFd, SOCKS5_REP_SUCCESS)) {
+    if (!transparent && !sendReply(clientFd, SOCKS5_REP_SUCCESS)) {
         emitEvent("[CONNECTION-END] result=client_reply_failed stage=socks_reply elapsed_ms=%ld",
                   elapsed());
         closeTrackedFd(remoteFd);

@@ -9,6 +9,7 @@ import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import androidx.core.content.ContextCompat
+import com.skytr1x.obhod.strategy.StrategyProfiles
 import com.skytr1x.obhod.ui.MainActivity
 import com.skytr1x.obhod.vpn.ZapretVpnService
 
@@ -35,7 +36,9 @@ class ObhodTileService : TileService() {
             )
             return
         }
-        if (VpnService.prepare(this) == null) {
+        val kernelMode = prefs.getString("selected_profile", StrategyProfiles.DEFAULT_ID) ==
+            StrategyProfiles.SULINUX_ID
+        if (kernelMode || VpnService.prepare(this) == null) {
             ObhodNotifications.markStarting(this)
             val started = runCatching {
                 ContextCompat.startForegroundService(
@@ -74,13 +77,17 @@ class ObhodTileService : TileService() {
         val running = prefs.getBoolean("running", false)
         val starting = prefs.getBoolean("starting", false)
         val active = running || starting
+        val kernelMode = prefs.getString("selected_profile", StrategyProfiles.DEFAULT_ID) ==
+            StrategyProfiles.SULINUX_ID
         qsTile?.apply {
             state = if (active) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE
             label = if (active) "Обход включён" else "Обход выключен"
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
                 subtitle = when {
                     starting -> "Запуск…"
+                    running && kernelMode -> "SULinux (root)"
                     running -> "Включён"
+                    kernelMode -> "SULinux: нужен root"
                     else -> "Нажмите, чтобы включить"
                 }
             }

@@ -7,6 +7,7 @@ import android.content.Context
 import android.content.Intent
 import androidx.core.app.NotificationCompat
 import com.skytr1x.obhod.R
+import com.skytr1x.obhod.strategy.StrategyProfiles
 import com.skytr1x.obhod.ui.MainActivity
 
 object ObhodNotifications {
@@ -20,6 +21,7 @@ object ObhodNotifications {
         const val CHANNEL_NAME = "Обход"
         const val TITLE = "Обход"
         const val RUNNING = "Системный обход и MTProxy работают"
+        const val KERNEL_RUNNING = "SULinux активен: ядерный обход без VPN"
         const val STARTING = "Запуск обхода…"
         const val STOPPING = "Остановка обхода…"
     }
@@ -73,8 +75,11 @@ object ObhodNotifications {
 
     private fun statusText(context: Context): String {
         val vpnPrefs = context.getSharedPreferences(VPN_PREFS, Context.MODE_PRIVATE)
+        val running = vpnPrefs.getBoolean("running", false)
+        val profile = vpnPrefs.getString("profile", "")
         return when {
-            vpnPrefs.getBoolean("running", false) -> Text.RUNNING
+            running && profile == StrategyProfiles.SULINUX_ID -> Text.KERNEL_RUNNING
+            running -> Text.RUNNING
             vpnPrefs.getBoolean("starting", false) -> Text.STARTING
             else -> Text.STOPPING
         }
